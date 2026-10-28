@@ -1,0 +1,21 @@
+# Dataset (not redistributed)
+ds/
+meta.json
+
+# Generated outputs and model weights
+outputs/
+*.pth
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
