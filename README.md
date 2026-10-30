@@ -1,115 +1,110 @@
 # TCruzi Analyzer
 
-Desktop application for the automated quantification of *Trypanosoma cruzi* infection in fluorescence microscopy images. From two-channel images (a nuclear stain such as DAPI/Hoechst plus a fluorescent parasite reporter), it segments host-cell nuclei, detects intracellular amastigotes, assigns them to individual cells and reports the **percentage of infected cells** and the **number of amastigotes per cell**. It processes whole batches and exports a formatted Excel report.
+Desktop tool that quantifies *Trypanosoma cruzi* infection in fluorescence microscopy images. Each image has two channels: nuclei (DAPI/Hoechst) and a parasite reporter. From them the tool segments the host-cell nuclei, finds the intracellular amastigotes, assigns each one to a cell, and reports the **percentage of infected cells** and the **amastigotes per cell**. It works on whole batches and exports an Excel report.
 
-I designed and developed the tool to replace manual counting of infected cells. It was built and tested on DAPI/DsRed images of infected cell cultures at early (2 hpi) and late (72 hpi) infection.
+I wrote it at the request of the Department of Parasitology of the University of Granada, to replace counting infected cells by hand.
 
-![Analysis overlay on a synthetic test image](docs/synthetic_overlay.png)
+![The interface after analysing the two example images](docs/gui_screenshot.jpg)
 
-*Overlay produced by the pipeline on the synthetic test image (see [Validation](#validation-on-a-synthetic-image)). Infected cells are labelled in yellow with their amastigote count, uninfected nuclei are shown in cyan, and detected amastigotes in magenta.*
+## Example
 
-## Pipeline
+These are two images of infected cultures from the lab, included in `examples/`. Each row shows the original image on the left and the analysis overlay on the right.
 
-1. **Input and channels.** Reads TIF and Nikon ND2 files. For ND2 files, the nuclear and parasite channels are detected automatically from the channel names. The parasite signal can come from one or several channels (e.g. red and green combined).
-2. **Optional cleaning** (`limpiador_imagenes.py`, enabled by default in the GUI):
-   - background subtraction;
-   - adaptive contrast enhancement (CLAHE) and mild denoising;
-   - standardisation of every image to a common layout: nuclei in blue, amastigotes in red, whichever colour they had originally.
-3. **Nucleus segmentation:**
-   - **On GPU:** [CellPose](https://github.com/MouseLand/cellpose), compatible with both 2.x and 4.x/cpsam. The nucleus diameter is estimated from the image. If CellPose finds clearly fewer nuclei than a classical estimate, it retries with more sensitive settings.
-   - **On CPU:** a fast classical watershed segmentation is used by default (`CPU_FAST_NUCLEI = True`). This takes seconds instead of minutes, so the tool can run on lab computers without a GPU.
-   - In both modes, merged nuclei are split and faint nuclei that were missed are rescued.
-4. **Amastigote detection:**
-   - Detection uses a classical adaptive threshold (several candidate methods, plus a size filter) or CellPose. In automatic mode, the method is chosen according to how dense the signal is.
-   - The area of a single amastigote is **calibrated automatically** from isolated parasites, with a confidence score. Dense parasite masses are then counted by area.
+![Example images and analysis overlays](docs/example_results.jpg)
+
+In the overlay:
+- infected cells have a yellow nucleus;
+- uninfected nuclei are blue-green;
+- detected amastigotes are magenta;
+- each nucleus is labelled with its ID and its amastigote count.
+
+| Image | Cells | Infected | Infected (%) | Amastigotes |
+|---|---|---|---|---|
+| A1_CH4 | 175 | 132 | 75.4 | 716 |
+| A5_CH4 | 146 | 104 | 71.2 | 658 |
+
+To reproduce them, run `python examples/run_examples.py`. It applies the same settings as the GUI defaults (cleaning on, classic detection) and takes a few seconds per image on CPU.
+
+## How it works
+
+1. **Channels.** It reads TIF and Nikon ND2 files. For ND2, the nuclear and parasite channels are picked from the channel names. The parasite signal can come from one channel or from several combined (e.g. red and green).
+2. **Cleaning** (`image_cleaner.py`, on by default in the GUI):
+   - background subtraction, CLAHE and light denoising;
+   - every image is rewritten in one layout: nuclei in blue, parasites in red, whatever colour they had originally;
+   - amastigotes that picked up the DNA stain and show up only in blue are moved to the parasite channel. Otherwise they would cluster into fake nuclei.
+3. **Nuclei.**
+   - On a GPU, nuclei are segmented with [CellPose](https://github.com/MouseLand/cellpose), versions 2.x or 4.x (cpsam). If it finds clearly fewer nuclei than a quick classic estimate, it retries once with more sensitive settings.
+   - On CPU, a classic watershed is used instead. It takes seconds rather than minutes, which is what made the tool usable on the lab computers.
+   - Both paths then split merged nuclei and recover faint ones that were missed.
+4. **Amastigotes.**
+   - They are detected with an adaptive threshold (or with CellPose, if asked), using a size filter.
+   - The area of a single amastigote is calibrated on each image from isolated parasites.
+   - Dense masses in late infections are estimated from their area. Small spots are counted one by one.
 5. **Assignment to cells**, in three passes:
-   1. Each amastigote goes to the nearest nucleus (KD-tree), within a cytoplasmic radius bounded by the neighbouring cells.
-   2. Free amastigotes that are in physical contact with a cluster already assigned to a cell join that cell (contiguity).
-   3. Remaining amastigotes close to a cell are assigned within an extended radius.
+   1. each amastigote goes to the nearest nucleus, within a cytoplasm radius limited by the neighbouring cells;
+   2. free amastigotes touching an already assigned cluster join that cell;
+   3. the ones still close to a cell are assigned within a wider radius.
 
-   Truly isolated background signal is left unassigned.
-6. **Output:**
-   - per-cell table (infected or not, amastigote count, sparse, cluster or dense mode);
-   - infection percentage and an overlay image for visual quality control;
-   - Excel report with a summary sheet and one sheet per image, including overlays and charts.
+   Isolated background signal stays unassigned.
+6. **Output.** A per-cell table, the infection percentage, the overlay, and an Excel report with a summary sheet plus one sheet per image, including images and charts.
 
-## Graphical interface
+## Interface
 
-`gui.py` is a Tkinter application. It provides:
+`gui.py` (Tkinter) gives you:
+- an image queue with the optional cleaning step;
+- the viewer (original, overlay, single channels, segmentation) with per-image and per-cell tables;
+- the hardware selector;
+- saved parameter profiles, kept in `%APPDATA%\TCruzi Analyzer` on Windows or `~/.tcruzi_analyzer` elsewhere;
+- the Excel export.
 
-- batch loading of images and the optional cleaning step;
-- an overlay viewer and a per-image results table;
-- **parameter profiles**, stored in `%APPDATA%\TCruzi Analyzer` on Windows or `~/.tcruzi_analyzer` elsewhere;
-- a hardware selector (auto / CPU / GPU);
-- Excel export.
+## Synthetic check
 
-The interface and code comments are in Spanish.
+`demo/synthetic_demo.py` builds an image with a known answer and runs the whole pipeline on it. It has 25 cells, 10 of them infected, and 63 amastigotes in total. The result is 25 cells, 10 infected and 60 amastigotes, with the exact amastigote count in 23 of the 25 cells. It needs no data and no GPU.
 
-## Validation on a synthetic image
-
-`demo/synthetic_demo.py` generates an image with a known ground truth and runs the full pipeline in CPU mode. The image has 25 host cells; 10 of them are infected with 3–8 amastigotes each, giving 63 amastigotes in total.
-
-| | Ground truth | Detected |
-|---|---|---|
-| Cells | 25 | 25 |
-| Infected cells | 10 | 10 |
-| Infection (%) | 40.0 | 40.0 |
-| Amastigotes | 63 | 60 |
-| Cells with exact amastigote count | – | 23 / 25 |
-
-The run takes about 2 s on CPU. This is a software sanity check of the pipeline, not a biological validation. Real microscopy images are noisier and are not included here.
-
-## Installation
+## Installation and use
 
 ```bash
 git clone https://github.com/jcleonmiguel/tcruzi-analyzer.git
 cd tcruzi-analyzer
-pip install -r requirements.txt   # Python 3.10–3.11 recommended
+pip install -r requirements.txt     # Python 3.10-3.11
+
+python gui.py                       # interface
+python examples/run_examples.py     # the two example images
+python demo/synthetic_demo.py       # synthetic check
+python image_cleaner.py <folder>    # clean a folder from the command line
 ```
 
-For GPU acceleration, install a **CUDA-enabled PyTorch** before installing CellPose (see [pytorch.org](https://pytorch.org/get-started/locally/)).
+For GPU use, install a CUDA-enabled PyTorch before CellPose.
 
-## Usage
+## GPU and CPU
 
-```bash
-python gui.py                              # graphical interface
-python demo/synthetic_demo.py              # synthetic sanity check (no GPU or data needed)
-python limpiador_imagenes.py <folder>      # clean a folder of images from the command line
-```
-
-The analysis can also be called from Python:
-
-```python
-from analyzer import run_analysis
-out = run_analysis("image.tif", blue_ch_idx=2, red_ch_idx=0, hardware_mode="auto")
-print(out["results"]["infection_pct"], out["results"]["infected_cells"])
-```
-
-## GPU vs CPU
-
-- **Running from source with a CUDA-enabled PyTorch:** GPU mode uses CellPose for nuclei.
-- **The packaged Windows build** (PyInstaller + Inno Setup, not included in this repository) **runs in CPU mode only.** GPU mode did not work in the installed program. CPU mode with fast watershed segmentation is the supported configuration there.
-- If GPU mode is selected and no usable CUDA device is found, the analyzer now **falls back to CPU** instead of failing.
+- When run from source with CUDA, the GPU mode uses CellPose for the nuclei.
+- The Windows installer the lab uses (built with PyInstaller and Inno Setup, not included here) only runs on CPU. The GPU mode never worked in the packaged build, so CPU with the fast watershed is the supported setup there.
+- If GPU mode is selected and no usable GPU is found, the analyzer falls back to CPU instead of failing.
 
 ## Limitations
 
-- Default thresholds and size ranges were tuned on images from a single lab setup. Other microscopes or staining protocols may need parameter adjustment; saved profiles make this easier.
-- The CPU watershed segmentation works well for rounded nuclei. For irregular or tightly packed nuclei, CellPose on GPU is more robust.
-- The repository includes no benchmark against manual counts on real images, because the lab images are not public.
+- **Thresholds and size ranges were tuned on images from one lab.** Other microscopes or staining protocols may need adjusting. Profiles exist for that.
+- **Amastigote counts in dense, late infections are estimates.** Packed parasites cannot be separated one by one, so masses are counted from their area. The infection percentage is the most robust output.
+- **The CPU watershed suits round nuclei.** Irregular or tightly packed nuclei segment better with CellPose on a GPU.
+- **There is no published comparison against manual counts.** The synthetic check only shows that the pipeline behaves as intended.
 
-## Repository structure
+## Files
 
 ```
-├── analyzer.py             # analysis pipeline (segmentation, detection, assignment, overlay)
-├── gui.py                  # Tkinter desktop interface, batch processing and Excel export
-├── limpiador_imagenes.py   # image cleaning / standardisation (GUI step or command line)
-├── profile_manager.py      # saved parameter profiles
-├── demo/synthetic_demo.py  # synthetic ground-truth test
-└── docs/                   # figures for this README
+├── analyzer.py          analysis pipeline
+├── gui.py               desktop interface and Excel report
+├── image_cleaner.py     cleaning / standardisation (GUI step or command line)
+├── profile_manager.py   saved parameter profiles
+├── examples/            two real images and run_examples.py
+├── demo/                synthetic check
+└── docs/                figures for this README
 ```
 
-## Author and licence
+## Credits and licence
 
-José Carlos León Miguel — [github.com/jcleonmiguel](https://github.com/jcleonmiguel)
+The example images are courtesy of the Department of Parasitology, University of Granada. They are shared for demonstration only and are not covered by the MIT licence.
 
-Released under the MIT License (see `LICENSE`).
+The code is released under the MIT License.
+
+José Carlos León Miguel · [github.com/jcleonmiguel](https://github.com/jcleonmiguel)
