@@ -1,21 +1,27 @@
-# Dataset (not redistributed)
-ds/
-meta.json
+# microscopy data stays out of the repo, except the two example images
+*.tif
+*.tiff
+*.nd2
+!examples/*.tif
+cleaned/
 
-# Generated outputs and model weights
-outputs/
-*.pth
-*.pt
+# generated reports, outputs and local settings
+*.xlsx
+*.csv
+examples/output/
+tcruzi_profiles.json
+demo/synthetic.tif
+demo/synthetic_overlay.png
 
-# Python
+# packaging
+build/
+dist/
+*.exe
+
 __pycache__/
 *.pyc
 .venv/
 venv/
-.ipynb_checkpoints/
-
-# OS / editors
 .DS_Store
 Thumbs.db
 .vscode/
-.idea/

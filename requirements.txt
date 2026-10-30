@@ -1,15 +1,16 @@
-# Core
 numpy
 scipy
 scikit-image
 tifffile
+imagecodecs        # LZW-compressed TIFFs, like the example images
 pillow
 openpyxl
+pandas             # only for examples/run_examples.py
 
-# Nucleus segmentation with CellPose (2.x and 4.x/cpsam are both supported).
-# For GPU acceleration install a CUDA-enabled PyTorch first:
+# Nucleus segmentation with CellPose (2.x and 4.x/cpsam both work).
+# For GPU use, install a CUDA-enabled PyTorch first:
 # https://pytorch.org/get-started/locally/
 cellpose
 
-# Optional: Nikon .nd2 files
+# optional: Nikon .nd2 files
 nd2

@@ -1,8 +1,4 @@
-"""
-PROFILE MANAGER - Sistema de Gestión de Perfiles
-================================================
-Gestiona configuraciones guardadas del T.cruzi Analyzer
-"""
+"""Saved parameter profiles for the analyzer (JSON in the user data folder)."""
 
 import os
 import json
@@ -11,11 +7,9 @@ from tkinter import simpledialog, messagebox
 
 
 def _get_user_data_dir() -> Path:
-    """
-    Carpeta de datos del usuario donde SÍ se puede escribir aunque el programa
-    esté instalado en 'Archivos de programa'.
-    Windows: %APPDATA%\\TCruzi Analyzer
-    Otros:   ~/.tcruzi_analyzer
+    """User data folder, writable even when the program is installed under
+    Program Files: %APPDATA%\\TCruzi Analyzer on Windows,
+    ~/.tcruzi_analyzer elsewhere.
     """
     if os.name == "nt":
         base = os.environ.get("APPDATA", str(Path.home()))
@@ -27,34 +21,34 @@ def _get_user_data_dir() -> Path:
 
 
 class ProfileManager:
-    """Gestor de perfiles de configuración"""
+    """Load, save, rename and delete parameter profiles."""
 
     def __init__(self, config_file="tcruzi_profiles.json"):
-        # Los perfiles viven en la carpeta de datos del usuario (escribible
-        # aunque el .exe esté en 'Archivos de programa').
+        # profiles live in the user data folder, which stays writable even
+        # when the .exe sits in Program Files
         self.config_file = _get_user_data_dir() / config_file
         self.profiles = {}
-        self.last_used = "Recomendado"
+        self.last_used = "Recommended"
         self.load_profiles()
     
     def load_profiles(self):
-        """Carga perfiles desde archivo JSON"""
+        """Load profiles from the JSON file."""
         if self.config_file.exists():
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self.profiles = data.get('profiles', {})
-                    self.last_used = data.get('last_used', 'Recomendado')
+                    self.last_used = data.get('last_used', 'Recommended')
             except Exception as e:
-                print(f"[Perfiles] Error al cargar: {e}")
+                print(f"[Profiles] could not load: {e}")
                 self._create_default_profile()
         else:
             self._create_default_profile()
     
     def _create_default_profile(self):
-        """Crea los perfiles de fábrica. Recomendado es el perfil por defecto."""
+        """Create the built-in profiles; Recommended is the default."""
         self.profiles = {
-            "Recomendado": {
+            "Recommended": {
                 "protected": True,
                 "blue_ch": 2,
                 "red_ch": 0,
@@ -96,11 +90,11 @@ class ProfileManager:
                 "hardware_mode": "auto"
             }
         }
-        self.last_used = "Recomendado"
+        self.last_used = "Recommended"
         self.save_profiles()
     
     def save_profiles(self):
-        """Guarda perfiles a archivo JSON"""
+        """Write profiles to the JSON file."""
         try:
             data = {
                 "last_used": self.last_used,
@@ -109,22 +103,22 @@ class ProfileManager:
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            print(f"[Perfiles] Error al guardar: {e}")
+            print(f"[Profiles] could not save: {e}")
     
     def get_profile(self, name):
-        """Obtiene un perfil por nombre"""
+        """Return a profile by name (Default if it does not exist)."""
         return self.profiles.get(name, self.profiles.get("Default"))
     
     def save_profile(self, name, config):
-        """Guarda o actualiza un perfil"""
+        """Save or update a profile."""
         if not name or name.strip() == "":
-            messagebox.showerror("Error", "El nombre no puede estar vacío")
+            messagebox.showerror("Error", "The name cannot be empty")
             return False
         
         if name in self.profiles and name != self.last_used:
             respuesta = messagebox.askyesno(
-                "Confirmar",
-                f"El perfil '{name}' ya existe.\n¿Deseas sobreescribirlo?"
+                "Confirm",
+                f"Profile '{name}' already exists.\nOverwrite it?"
             )
             if not respuesta:
                 return False
@@ -137,21 +131,21 @@ class ProfileManager:
         return True
     
     def delete_profile(self, name):
-        """Elimina un perfil"""
+        """Delete a profile."""
         if name not in self.profiles:
-            messagebox.showerror("Error", f"El perfil '{name}' no existe")
+            messagebox.showerror("Error", f"Profile '{name}' does not exist")
             return False
         
         if self.profiles[name].get("protected", False):
             messagebox.showwarning(
-                "Protegido",
-                f"El perfil '{name}' está protegido y no se puede eliminar"
+                "Protected",
+                f"Profile '{name}' is protected and cannot be deleted"
             )
             return False
         
         respuesta = messagebox.askyesno(
-            "Confirmar",
-            f"¿Seguro que deseas eliminar el perfil '{name}'?\nEsta acción no se puede deshacer."
+            "Confirm",
+            f"Delete profile '{name}'?\nThis cannot be undone."
         )
         
         if respuesta:
@@ -164,24 +158,24 @@ class ProfileManager:
         return False
     
     def rename_profile(self, old_name, new_name):
-        """Renombra un perfil"""
+        """Rename a profile."""
         if old_name not in self.profiles:
-            messagebox.showerror("Error", f"El perfil '{old_name}' no existe")
+            messagebox.showerror("Error", f"Profile '{old_name}' does not exist")
             return False
         
         if self.profiles[old_name].get("protected", False):
             messagebox.showwarning(
-                "Protegido",
-                f"El perfil '{old_name}' está protegido y no se puede renombrar"
+                "Protected",
+                f"Profile '{old_name}' is protected and cannot be renamed"
             )
             return False
         
         if not new_name or new_name.strip() == "":
-            messagebox.showerror("Error", "El nuevo nombre no puede estar vacío")
+            messagebox.showerror("Error", "The new name cannot be empty")
             return False
         
         if new_name in self.profiles:
-            messagebox.showerror("Error", f"Ya existe un perfil llamado '{new_name}'")
+            messagebox.showerror("Error", f"A profile called '{new_name}' already exists")
             return False
         
         self.profiles[new_name] = self.profiles.pop(old_name)
@@ -193,15 +187,15 @@ class ProfileManager:
         return True
     
     def get_profile_names(self):
-        """Retorna lista de nombres de perfiles"""
+        """Return the profile names."""
         return list(self.profiles.keys())
     
     def set_last_used(self, name):
-        """Establece el último perfil usado"""
+        """Remember the last profile used."""
         if name in self.profiles:
             self.last_used = name
             self.save_profiles()
     
     def is_protected(self, name):
-        """Verifica si un perfil está protegido"""
+        """True if the profile is protected."""
         return self.profiles.get(name, {}).get("protected", False)

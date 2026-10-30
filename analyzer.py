@@ -1,7 +1,5 @@
-"""
-T. cruzi Amastigote Infection Analyzer — v7
-Pipeline completo: CellPose GPU + detección híbrida disperso/denso por célula.
-"""
+"""T. cruzi infection analysis: nucleus segmentation, amastigote detection
+and assignment of parasites to host cells."""
 
 import numpy as np
 from pathlib import Path
@@ -9,10 +7,7 @@ import warnings
 
 
 def _remove_small(binary, size):
-    """
-    Elimina objetos menores que 'size'. Compatible con todas las versiones de
-    skimage (nuevas usan max_size, viejas min_size).
-    """
+    """remove_small_objects across skimage versions (max_size vs min_size)."""
     from skimage import morphology as sk_m
     try:
         return sk_m.remove_small_objects(binary, max_size=size)
@@ -20,90 +15,81 @@ def _remove_small(binary, size):
         return sk_m.remove_small_objects(binary, min_size=size)
 warnings.filterwarnings('ignore')
 
-# ─── GPU check ────────────────────────────────────────────────────────────────
+# --- hardware ---
 def _check_gpu(force_mode="auto") -> bool:
-    '''
-    Detecta GPU con soporte para modo forzado
-    Args:
-        force_mode: "auto", "gpu", o "cpu"
-    '''
+    """Return True if CellPose should run on the GPU (force_mode: auto/gpu/cpu)."""
     if force_mode == "cpu":
-        print("[Hardware] 🖥 Modo CPU FORZADO por usuario")
+        print("[Hardware] CPU forced by user")
         return False
     elif force_mode == "gpu":
-        # Verificar que la GPU es realmente utilizable (PyTorch con CUDA).
-        # En el ejecutable empaquetado PyTorch puede no incluir CUDA: en ese caso
-        # forzar GPU haría fallar CellPose, así que se vuelve a CPU con aviso.
+        # Forcing GPU is not enough: the packaged build may ship PyTorch
+        # without CUDA, and then CellPose fails. Check first and fall back
+        # to CPU if the GPU is not usable.
         try:
             from cellpose import core
             if core.use_gpu():
-                print("[Hardware] ⚡ Modo GPU FORZADO por usuario")
+                print("[Hardware] GPU forced by user")
                 return True
         except Exception:
             pass
-        print("[Hardware] ⚠ GPU solicitada pero no disponible (PyTorch sin CUDA) "
-              "→ se usa CPU")
+        print("[Hardware] GPU requested but not available (PyTorch without CUDA), "
+              "using CPU")
         return False
     else:  # auto
         try:
             from cellpose import core
             gpu = core.use_gpu()
             if gpu:
-                print("[Hardware] ✓ GPU detectada - Modo GPU activado")
+                print("[Hardware] GPU detected")
             else:
-                print("[Hardware] CPU detectado - Modo CPU activado")
+                print("[Hardware] no GPU found, using CPU")
             return gpu
         except Exception:
-            print("[Hardware] CPU por defecto")
+            print("[Hardware] no GPU, using CPU")
             return False
 
-USE_GPU = _check_gpu()  # Default auto al inicio
+USE_GPU = _check_gpu()
 
-# ─── Aceleración CPU: downscale para segmentación de núcleos ───────────────────
-# En CPU, CellPose escala con el nº de píxeles. Los núcleos son grandes (~60px),
-# así que segmentarlos a media resolución da resultados equivalentes en ~1/4 del
-# tiempo. La máscara resultante se reescala al tamaño original con vecino más
-# cercano (preserva las etiquetas enteras de cada núcleo).
-# Solo se activa en CPU y solo si la imagen es grande y los núcleos no son diminutos.
-CPU_DOWNSCALE_ENABLED  = True     # poner False para desactivar por completo
-CPU_DOWNSCALE_MIN_DIM  = 1000     # solo si la dimensión menor supera esto
-CPU_DOWNSCALE_TARGET   = 768      # dimensión menor objetivo tras reducir (cpsam CPU)
-CPU_DOWNSCALE_MIN_DIAM = 24       # no reducir si los núcleos miden < 24px
+# --- CPU speed-up: segment nuclei at reduced resolution ---
+# On CPU, CellPose time grows with pixel count. Nuclei are large (~60 px),
+# so half resolution gives the same masks in about a quarter of the time.
+# The mask is scaled back with nearest neighbour to keep integer labels.
+# Only used on CPU, for large images whose nuclei are not tiny.
+CPU_DOWNSCALE_ENABLED  = True
+CPU_DOWNSCALE_MIN_DIM  = 1000     # only when the short side is larger than this
+CPU_DOWNSCALE_TARGET   = 768      # target short side after downscaling
+CPU_DOWNSCALE_MIN_DIAM = 24       # keep full resolution if nuclei are smaller than this
 
-# ─── Modo CPU rápido: segmentar núcleos sin CellPose ───────────────────────────
-# cpsam (CellPose 4.x) en CPU tarda MINUTOS por imagen y es inviable para
-# desplegar en equipos sin GPU. El watershed clásico segmenta núcleos en
-# SEGUNDOS con calidad equivalente para núcleos redondeados típicos (DAPI).
-# Cuando está activo y se corre en CPU, se usa watershed clásico directamente
-# y se omite cpsam por completo. En GPU se usa siempre CellPose (rápido).
-CPU_FAST_NUCLEI = True   # True = watershed clásico en CPU (rápido)
-                          # False = CellPose también en CPU (lento, calidad cpsam)
+# --- fast CPU mode: classic watershed instead of CellPose ---
+# cpsam (CellPose 4.x) takes minutes per image on CPU, which is not
+# workable on lab computers without a GPU. A classic watershed does the
+# same job in seconds for the round DAPI nuclei we usually see.
+# On GPU, CellPose is always used.
+CPU_FAST_NUCLEI = True   # True: watershed on CPU (fast)
+                          # False: CellPose on CPU as well (slow)
 
 
 def _compute_downscale_factor(shape, diameter, use_gpu):
-    """
-    Decide el factor de reducción para la segmentación de núcleos en CPU.
-    Devuelve 1.0 (sin reducir) o un factor < 1.0.
+    """Downscale factor for nucleus segmentation on CPU (1.0 = keep size).
 
-    Nota: cpsam (CellPose 4.x) en CPU es muy pesado, por eso el objetivo es
-    agresivo (768px). Los núcleos grandes (~50px) se segmentan bien incluso a
-    esa resolución porque seguirán midiendo ~19px tras reducir.
+    The target is aggressive (768 px) because cpsam is heavy on CPU; nuclei
+    of ~50 px are still ~19 px after downscaling, which segments fine.
     """
     if use_gpu or not CPU_DOWNSCALE_ENABLED:
         return 1.0
     min_dim = min(shape[0], shape[1])
     if min_dim <= CPU_DOWNSCALE_MIN_DIM:
         return 1.0
-    # Si los núcleos ya son pequeños, reducir los haría indetectables
+    # small nuclei would disappear if we shrank them further
     if diameter is not None and diameter < CPU_DOWNSCALE_MIN_DIAM:
         return 1.0
     factor = CPU_DOWNSCALE_TARGET / min_dim
-    factor = max(0.25, min(1.0, factor))  # no reducir más de 4x
+    factor = max(0.25, min(1.0, factor))  # never more than 4x
     return factor
 
 
 def _downscale_for_nuclei(blue_channel, factor):
-    """Reduce el canal azul. Devuelve (imagen_reducida, shape_original)."""
+    """Downscale the nuclear channel. Returns (small_image, original_shape)."""
     if factor >= 0.999:
         return blue_channel, blue_channel.shape
     from skimage.transform import resize
@@ -116,7 +102,7 @@ def _downscale_for_nuclei(blue_channel, factor):
 
 
 def _upscale_mask(mask, orig_shape):
-    """Reescala una máscara etiquetada al tamaño original (vecino más cercano)."""
+    """Scale a label mask back to the original size (nearest neighbour)."""
     if tuple(mask.shape) == tuple(orig_shape):
         return mask
     from skimage.transform import resize
@@ -125,22 +111,22 @@ def _upscale_mask(mask, orig_shape):
     return up
 
 
-# ─── CellPose model cache ──────────────────────────────────────────────────────
+# --- CellPose model cache ---
 _CELLPOSE_MODEL = None
 _CELLPOSE_MODEL_GPU = None
-_CELLPOSE_IS_V4 = None  # se detecta una vez
+_CELLPOSE_IS_V4 = None  # detected once
 
 
 def _cellpose_is_v4():
-    """Detecta si CellPose es 4.x+ (API CellposeModel/cpsam) o 2.x (API Cellpose)."""
+    """True for CellPose 4.x (CellposeModel/cpsam), False for 2.x."""
     global _CELLPOSE_IS_V4
     if _CELLPOSE_IS_V4 is None:
         from cellpose import models
-        # En 4.x no existe models.Cellpose; en 2.x sí
+        # models.Cellpose only exists in 2.x
         _CELLPOSE_IS_V4 = not hasattr(models, "Cellpose")
         try:
             import cellpose
-            print(f"[CellPose] Versión {cellpose.version} "
+            print(f"[CellPose] version {cellpose.version} "
                   f"({'API 4.x/cpsam' if _CELLPOSE_IS_V4 else 'API 2.x'})")
         except Exception:
             pass
@@ -148,11 +134,10 @@ def _cellpose_is_v4():
 
 
 def _eval_cellpose(model, image, diameter, flow_threshold, cellprob_threshold):
-    """
-    Llama a model.eval de forma compatible con CellPose 2.x y 4.x.
-    Devuelve siempre solo 'masks'.
-    - 2.x: eval(..., channels=[0,0]) y devuelve 4 valores
-    - 4.x (cpsam): sin 'channels', devuelve 3 valores, imagen monocanal directa
+    """Call model.eval on CellPose 2.x or 4.x and return only the masks.
+
+    2.x needs channels=[0,0] and returns 4 values; 4.x (cpsam) takes a
+    single-channel image directly and returns 3.
     """
     if _cellpose_is_v4():
         out = model.eval(image, diameter=diameter,
@@ -163,40 +148,40 @@ def _eval_cellpose(model, image, diameter, flow_threshold, cellprob_threshold):
                          flow_threshold=flow_threshold,
                          cellprob_threshold=cellprob_threshold,
                          channels=[0, 0])
-    return out[0]  # masks es siempre el primer elemento
+    return out[0]  # masks always come first
 
 
 def _get_cellpose_model():
     global _CELLPOSE_MODEL, _CELLPOSE_MODEL_GPU
     if _CELLPOSE_MODEL is None or _CELLPOSE_MODEL_GPU != USE_GPU:
         from cellpose import models
-        print(f"[CellPose] Cargando modelo de núcleos (GPU: {USE_GPU})...")
+        print(f"[CellPose] loading nucleus model (GPU: {USE_GPU})...")
         if _cellpose_is_v4():
-            # CellPose 4.x: modelo único cpsam (cell + nucleus, generalista)
+            # CellPose 4.x ships a single generalist model (cpsam)
             _CELLPOSE_MODEL = models.CellposeModel(gpu=USE_GPU)
             _CELLPOSE_MODEL_GPU = USE_GPU
-            print("[CellPose] ✓ Modelo cpsam (4.x) cargado correctamente")
+            print("[CellPose] loaded cpsam (4.x)")
         else:
             # CellPose 2.x: modelo 'nuclei', fallback a 'cyto2'
             try:
                 _CELLPOSE_MODEL = models.Cellpose(gpu=USE_GPU, model_type='nuclei')
                 _CELLPOSE_MODEL_GPU = USE_GPU
-                print("[CellPose] ✓ Modelo 'nuclei' (2.x) cargado correctamente")
+                print("[CellPose] loaded 'nuclei' (2.x)")
             except Exception as e:
-                print(f"[CellPose] ⚠ Error cargando 'nuclei': {e}, probando 'cyto2'...")
+                print(f"[CellPose] could not load 'nuclei': {e}, trying 'cyto2'...")
                 try:
                     _CELLPOSE_MODEL = models.Cellpose(gpu=USE_GPU, model_type='cyto2')
                     _CELLPOSE_MODEL_GPU = USE_GPU
-                    print("[CellPose] ✓ Modelo 'cyto2' (2.x) cargado correctamente")
+                    print("[CellPose] loaded 'cyto2' (2.x)")
                 except Exception as e2:
                     raise RuntimeError(
-                        f"No se pudo cargar ningún modelo de CellPose: {e2}\n"
-                        "Verifica que los modelos estén descargados correctamente."
+                        f"Could not load any CellPose model: {e2}\n"
+                        "Check that the CellPose models are downloaded."
                     )
     return _CELLPOSE_MODEL
 
 
-# ─── Image I/O ────────────────────────────────────────────────────────────────
+# --- image I/O ---
 def load_image(filepath: str):
     filepath = Path(filepath)
     ext = filepath.suffix.lower()
@@ -220,7 +205,7 @@ def load_image(filepath: str):
 
 
 def _standardize_channel(ch: np.ndarray, mode: str = "nuclei") -> np.ndarray:
-    """Estandarización universal: BG subtraction + normalización adaptativa."""
+    """Background subtraction + adaptive normalisation for one channel."""
     from skimage import exposure as sk_exp, filters as sk_f
 
     ch = ch.astype(np.float32)
@@ -233,25 +218,25 @@ def _standardize_channel(ch: np.ndarray, mode: str = "nuclei") -> np.ndarray:
     if ch.max() == 0:
         return np.zeros_like(ch, dtype=np.uint8)
 
-    # BG subtraction siempre para núcleos (elimina fondo difuso/gradientes)
+    # nuclei: remove diffuse background and illumination gradients
     if mode == "nuclei":
         bg_s  = max(10, min(ch.shape) // 20)
         corr  = np.clip(ch - sk_f.gaussian(ch, sigma=bg_s), 0, None)
-        # CLAHE SIEMPRE: ecualización local de contraste. Recupera núcleos
-        # tenues/oscuros que un simple stretch p1-p99 aplastaría hasta hacerlos
-        # invisibles para CellPose. clip_limit bajo evita amplificar ruido.
+        # CLAHE brings back faint nuclei that a plain p1-p99 stretch would
+        # flatten until CellPose cannot see them. A low clip limit keeps
+        # noise from being amplified.
         corr_01 = corr / (corr.max() + 1e-6)
         corr    = sk_exp.equalize_adapthist(corr_01, clip_limit=0.01) * 255
-        # Stretch suave de respaldo (percentiles amplios para no recortar señal)
+        # gentle stretch on top, with wide percentiles so no signal is clipped
         lo, hi = np.percentile(corr, 0.5), np.percentile(corr, 99.8)
         if hi <= lo: hi = float(corr.max())
         result = np.clip((corr - lo) / (hi - lo + 1e-6) * 255, 0, 255)
-        print(f"  [{mode}] BG_sub(sigma={bg_s}) + CLAHE → std={result.std():.1f}")
+        print(f"  [{mode}] background subtraction (sigma={bg_s}) + CLAHE, std={result.std():.1f}")
 
     else:  # amastigotes
-        # Los amastigotes son PUNTOS BRILLANTES. El fondo difuso NO cuenta.
-        # Background subtraction + umbral absoluto: los amastigotes reales superan
-        # ~20 tras quitar fondo; el fondo difuso queda por debajo de ~10.
+        # Amastigotes are small bright spots; diffuse background must not count.
+        # After background subtraction real parasites sit above ~20 and the
+        # diffuse background below ~10, so an absolute floor works.
         bg_s = max(8, min(ch.shape) // 40)
         corr = np.clip(ch - sk_f.gaussian(ch, sigma=bg_s), 0, None)
 
@@ -259,19 +244,17 @@ def _standardize_channel(ch: np.ndarray, mode: str = "nuclei") -> np.ndarray:
         if len(cvals) < 10:
             return np.zeros_like(ch, dtype=np.uint8)
 
-        # Umbral de detección: combina absoluto mínimo con percentil alto
-        # para adaptarse a distinto brillo pero sin capturar fondo difuso
+        # threshold: an absolute minimum or a high percentile, whichever is
+        # larger, to follow image brightness without picking up background
         p99   = float(np.percentile(corr, 99))
         p999  = float(np.percentile(corr, 99.9))
-        # El umbral debe estar bien por encima del fondo:
-        # mínimo absoluto 15, o el p99 si la imagen tiene más señal
         noise_floor = max(15.0, p99 * 0.6)
 
         hi = max(p999, noise_floor + 10)
-        # Mapear: noise_floor → 30, hi → 255; por debajo del floor → 0
+        # map noise_floor -> 30 and hi -> 255; below the floor -> 0
         result = np.clip((corr - noise_floor) / (hi - noise_floor + 1e-6) * 225 + 30, 0, 255)
         result[corr < noise_floor] = 0
-        print(f"  [{mode}] BG_sub + umbral_abs: noise_floor={noise_floor:.1f}, hi={hi:.1f}")
+        print(f"  [{mode}] background subtraction + absolute threshold: noise_floor={noise_floor:.1f}, hi={hi:.1f}")
 
     out = result.astype(np.uint8)
     print(f"  [{mode}] output: mean={out.mean():.1f}, std={out.std():.1f}, "
@@ -280,10 +263,7 @@ def _standardize_channel(ch: np.ndarray, mode: str = "nuclei") -> np.ndarray:
 
 
 def _estimate_nucleus_diameter(blue_channel: np.ndarray) -> int:
-    """
-    Mide el diámetro real de los núcleos en la imagen.
-    Funciona con cualquier zoom de microscopio.
-    """
+    """Measure the typical nucleus diameter in the image (any magnification)."""
     from skimage import filters as sk_f, morphology as sk_m, measure as sk_meas
     import math
 
@@ -311,15 +291,15 @@ def _estimate_nucleus_diameter(blue_channel: np.ndarray) -> int:
 
     diameters = [2*math.sqrt(r.area/math.pi) for r in valid]
     estimated = int(max(20, min(200, np.median(diameters))))
-    print(f"[CellPose] Diámetro medido en imagen: {estimated}px "
-          f"(n={len(valid)}, rango {min(diameters):.0f}-{max(diameters):.0f}px)")
+    print(f"[CellPose] nucleus diameter measured on the image: {estimated}px "
+          f"(n={len(valid)}, range {min(diameters):.0f}-{max(diameters):.0f}px)")
     return estimated
 
 
 def extract_channels(img: np.ndarray, blue_ch: int, red_ch: int,
                      amas_channel_indices: list = None,
                      meta: dict = None):
-    """Extrae y estandariza canales. Funciona con cualquier imagen."""
+    """Extract and standardise the nuclear and parasite channels."""
     arr = img.astype(np.float32)
     if arr.ndim == 4:
         arr = arr.max(axis=0)
@@ -332,7 +312,7 @@ def extract_channels(img: np.ndarray, blue_ch: int, red_ch: int,
                 return arr[:, :, min(idx, arr.shape[2]-1)]
         return arr.copy()
 
-    # Auto-detección ND2
+    # ND2: pick channels from their names
     fp = (meta or {}).get("filepath", "")
     if fp and fp.lower().endswith(".nd2"):
         try:
@@ -347,11 +327,11 @@ def extract_channels(img: np.ndarray, blue_ch: int, red_ch: int,
                                                   'green','gfp','fitc','qgreen','alexa']):
                         ar = i
             if ab is not None and ar is not None:
-                print(f"[Canales] ND2 auto: núcleos={ab}, amas={ar}")
+                print(f"[Channels] ND2 auto: nuclei={ab}, amastigotes={ar}")
                 blue_ch, red_ch = ab, ar
                 amas_channel_indices = [ar]
         except Exception as e:
-            print(f"[Canales] ND2 auto falló: {e}")
+            print(f"[Channels] ND2 auto-detection failed: {e}")
 
     blue_raw = _get_ch(blue_ch)
     if amas_channel_indices and len(amas_channel_indices) > 0:
@@ -360,15 +340,15 @@ def extract_channels(img: np.ndarray, blue_ch: int, red_ch: int,
     else:
         red_raw = _get_ch(red_ch)
 
-    print(f"[Canales] Núcleos=canal{blue_ch}, Amastigotes=canal{red_ch}")
+    print(f"[Channels] nuclei=channel {blue_ch}, amastigotes=channel {red_ch}")
     return _standardize_channel(blue_raw, "nuclei"), _standardize_channel(red_raw, "amastigotes")
 
 
-# ─── Nucleus Segmentation ─────────────────────────────────────────────────────
+# --- nucleus segmentation ---
 def _count_nuclei_classic(blue_channel: np.ndarray, diameter: int) -> int:
-    """
-    Estima el número de núcleos por detección clásica (watershed).
-    Sirve como referencia para validar la detección de CellPose.
+    """Rough nucleus count with a classic watershed.
+
+    Used as a reference to tell whether CellPose missed nuclei.
     """
     from skimage import filters as sk_f, morphology as sk_m, measure as sk_meas, segmentation
     from skimage.feature import peak_local_max
@@ -380,11 +360,11 @@ def _count_nuclei_classic(blue_channel: np.ndarray, diameter: int) -> int:
 
     sm  = sk_f.gaussian(ch, sigma=4)
     thr = sk_f.threshold_otsu(sm)
-    binary = sm > (thr * 0.6)  # umbral permisivo para incluir tenues
-    min_area = int(np.pi * (diameter/2)**2 * 0.3)  # 30% del área esperada
+    binary = sm > (thr * 0.6)  # permissive threshold so faint nuclei are included
+    min_area = int(np.pi * (diameter/2)**2 * 0.3)  # 30% of the expected nucleus area
     binary = _remove_small(binary, max(50, min_area))
 
-    # Watershed para separar núcleos pegados
+    # watershed to split touching nuclei
     dist = ndimage.distance_transform_edt(binary)
     min_dist = max(10, int(diameter * 0.5))
     coords = peak_local_max(dist, min_distance=min_dist, labels=binary)
@@ -406,10 +386,10 @@ def _count_nuclei_classic_safe(blue_channel, diameter):
 
 
 def segment_nuclei_watershed(blue_channel: np.ndarray, diameter: int = None) -> np.ndarray:
-    """
-    Segmentación de núcleos por watershed clásico.
-    Robusto para núcleos tenues que CellPose no detecta.
-    Detecta núcleos como objetos brillantes sobre fondo oscuro.
+    """Nucleus segmentation with a classic watershed.
+
+    Handles faint nuclei that CellPose sometimes misses: nuclei are bright
+    objects on a dark background.
     """
     from skimage import filters as sk_f, morphology as sk_m, segmentation
     from skimage.feature import peak_local_max
@@ -422,22 +402,22 @@ def segment_nuclei_watershed(blue_channel: np.ndarray, diameter: int = None) -> 
     if diameter is None:
         diameter = _estimate_nucleus_diameter(ch)
 
-    # Suavizado y umbral permisivo (captura núcleos tenues)
+    # smooth, then a permissive threshold to keep faint nuclei
     sm  = sk_f.gaussian(ch, sigma=4)
     thr = sk_f.threshold_otsu(sm)
     binary = sm > (thr * 0.55)
 
-    # Limpiar: quitar objetos pequeños (amastigotes), rellenar huecos
+    # drop small objects (amastigotes) and fill holes
     min_area = int(np.pi * (diameter/2)**2 * 0.25)
     binary = _remove_small(binary, max(100, min_area))
     binary = sk_m.closing(binary, sk_m.disk(3))
     binary = ndimage.binary_fill_holes(binary)
 
-    # Watershed para separar núcleos pegados
+    # watershed to split touching nuclei
     dist = ndimage.distance_transform_edt(binary)
-    # Suavizar la transformada de distancia (proporcional al diámetro): elimina
-    # los picos espurios que crean los nucleolos/textura interna y que harían
-    # partir un núcleo en dos. Sin esto, núcleos con nucleolo se sobre-cuentan.
+    # Smooth the distance transform in proportion to the diameter.
+    # Nucleoli and internal texture create extra peaks that would split
+    # one nucleus in two; without this, nucleolated nuclei are overcounted.
     dist = sk_f.gaussian(dist, sigma=max(1.0, diameter * 0.08))
     min_dist = max(4, int(diameter * 0.30))
     coords = peak_local_max(dist, min_distance=min_dist, labels=binary,
@@ -453,15 +433,15 @@ def segment_nuclei_watershed(blue_channel: np.ndarray, diameter: int = None) -> 
         markers[y, x] = i
     ws = segmentation.watershed(-dist, markers, mask=binary)
 
-    print(f"[Watershed] {ws.max()} núcleos detectados (diam={diameter}px, min_dist={min_dist})")
+    print(f"[Watershed] {ws.max()} nuclei (diam={diameter}px, min_dist={min_dist})")
     return ws.astype(np.int32)
 
 
 def _split_merged_nuclei(masks: np.ndarray, diameter: int) -> np.ndarray:
-    """
-    Separa núcleos que CellPose fusionó en una sola máscara.
-    Detecta etiquetas anormalmente grandes (cúmulos pegados) y las parte por
-    watershed sobre la transformada de distancia. No toca las máscaras normales.
+    """Split nuclei that CellPose merged into a single mask.
+
+    Only labels that are clearly larger than one nucleus are touched; they
+    are re-split by watershed on the distance transform.
     """
     from skimage import measure as sk_meas, segmentation, filters as sk_f
     from skimage.feature import peak_local_max
@@ -478,19 +458,19 @@ def _split_merged_nuclei(masks: np.ndarray, diameter: int) -> np.ndarray:
     split_count = 0
 
     for r in regions:
-        # Solo intervenir si la máscara es claramente mayor que 1 núcleo
+        # only act when the mask is clearly larger than one nucleus
         if r.area < expected_area * 1.6:
             continue
         sub = (masks[r.slice] == r.label)
         dist = ndi.distance_transform_edt(sub)
-        # Suavizado proporcional al diámetro: ignora nucleolos/textura interna
-        # para no partir un núcleo en dos por sus huecos internos.
+        # smoothing proportional to the diameter, so internal holes and
+        # nucleoli do not split a nucleus
         dist = sk_f.gaussian(dist, sigma=max(1.0, diameter * 0.08))
         min_d = max(4, int(diameter * 0.30))
         coords = peak_local_max(dist, min_distance=min_d, labels=sub,
                                 exclude_border=False)
         if len(coords) < 2:
-            continue  # un solo núcleo, no partir
+            continue  # a single nucleus, leave it
         seeds = np.zeros(dist.shape, dtype=bool)
         seeds[tuple(coords.T)] = True
         markers, _ = ndi.label(seeds)
@@ -498,7 +478,7 @@ def _split_merged_nuclei(masks: np.ndarray, diameter: int) -> np.ndarray:
         n_parts = int(ws.max())
         if n_parts < 2:
             continue
-        # Reescribir: primer fragmento conserva la etiqueta, el resto nuevas
+        # first piece keeps the label, the rest get new ones
         sl = r.slice
         region_out = out[sl]
         for p in range(1, n_parts + 1):
@@ -512,17 +492,16 @@ def _split_merged_nuclei(masks: np.ndarray, diameter: int) -> np.ndarray:
         split_count += (n_parts - 1)
 
     if split_count:
-        print(f"[Split] {split_count} núcleos fusionados separados → total {out.max()}")
+        print(f"[Split] {split_count} merged nuclei split, total {out.max()}")
     return out
 
 
 def _rescue_missed_nuclei(masks: np.ndarray, blue_channel: np.ndarray,
                           diameter: int) -> np.ndarray:
-    """
-    Recupera núcleos reales que CellPose descartó por tener forma difusa o
-    irregular (no por falta de brillo). Busca regiones de señal azul que NO
-    quedaron etiquetadas, las valida por tamaño y las añade como núcleos nuevos.
-    Núcleos grandes se parten por watershed para no subcontar.
+    """Recover nuclei that CellPose dropped for being diffuse or irregular.
+
+    Looks for nuclear signal that was left unlabelled, checks its size and
+    adds it as new nuclei. Large regions are split by watershed.
     """
     from skimage import filters as sk_f, measure as sk_meas, morphology as sk_m, segmentation
     from skimage.feature import peak_local_max
@@ -535,13 +514,13 @@ def _rescue_missed_nuclei(masks: np.ndarray, blue_channel: np.ndarray,
 
     nuc_area = math.pi * (diameter / 2) ** 2
 
-    # Máscara permisiva de TODA la señal de núcleo (capta también los difusos)
+    # permissive mask of all nuclear signal, diffuse nuclei included
     thr = sk_f.threshold_otsu(ch)
     signal = ch > thr * 0.55
     signal = ndi.binary_fill_holes(signal)
     signal = _remove_small(signal, int(nuc_area * 0.4))
 
-    # Restar lo que CellPose ya detectó (con margen para no re-capturar bordes)
+    # remove what CellPose already found (with a margin around the edges)
     already = sk_m.binary_dilation(masks > 0, sk_m.disk(2))
     missed  = signal & ~already
     missed  = _remove_small(missed, int(nuc_area * 0.5))
@@ -558,7 +537,7 @@ def _rescue_missed_nuclei(masks: np.ndarray, blue_channel: np.ndarray,
             continue
         sub = np.zeros(ch.shape, bool)
         sub[r.slice][r.image] = True
-        # Si la región es grande, partir en varios núcleos plausibles
+        # large regions are split into several plausible nuclei
         if r.area > nuc_area * 1.6:
             dist = ndi.distance_transform_edt(sub)
             dist = sk_f.gaussian(dist, sigma=max(1.0, diameter * 0.08))
@@ -574,7 +553,7 @@ def _rescue_missed_nuclei(masks: np.ndarray, blue_channel: np.ndarray,
         out[sub] = next_label; next_label += 1; rescued += 1
 
     if rescued:
-        print(f"[Rescate] {rescued} núcleos difusos recuperados → total {out.max()}")
+        print(f"[Rescue] {rescued} diffuse nuclei recovered, total {out.max()}")
     return out
 
 
@@ -582,178 +561,173 @@ def segment_nuclei(blue_channel: np.ndarray,
                    diameter=None,
                    flow_threshold: float = 0.4,
                    cellprob_threshold: float = 0.0) -> np.ndarray:
-    """
-    Segmenta núcleos con CellPose.
-    
-    IMPORTANTE: En CellPose 2.2.3, diameter=None (auto) a veces falla.
-    Si diameter=None, estimamos un valor razonable basado en la imagen.
+    """Segment nuclei with CellPose.
+
+    CellPose 2.2.3 sometimes fails with diameter=None, so in that case the
+    diameter is estimated from the image first.
     """
     
     if diameter is None:
         diameter = _estimate_nucleus_diameter(blue_channel)
-        print(f"[CellPose] diameter=auto → {diameter}px (medido en imagen)")
+        print(f"[CellPose] diameter=auto -> {diameter}px (measured on the image)")
     
-    # Verificar que la imagen tenga contenido
     if blue_channel.max() == 0:
-        print("[CellPose] ⚠ WARNING: Canal azul completamente negro")
+        print("[CellPose] warning: nuclear channel is empty")
         return np.zeros_like(blue_channel, dtype=np.int32)
     
     if blue_channel.std() < 5:
-        print(f"[CellPose] ⚠ WARNING: Canal azul con muy poco contraste (std={blue_channel.std():.1f})")
+        print(f"[CellPose] warning: very low contrast in the nuclear channel (std={blue_channel.std():.1f})")
 
-    # ── MODO CPU RÁPIDO: watershed clásico en lugar de cpsam ────────────────────
-    # cpsam en CPU tarda minutos. El watershed clásico da núcleos en segundos.
-    # Solo aplica en CPU; en GPU se usa CellPose (más abajo).
+    # fast CPU mode: classic watershed instead of cpsam
     if CPU_FAST_NUCLEI and not USE_GPU:
-        print(f"[CPU-Rápido] Segmentando núcleos por watershed clásico "
-              f"(diámetro={diameter}px) — evitando cpsam en CPU")
+        print(f"[CPU-fast] segmenting nuclei with a classic watershed "
+              f"(diameter={diameter}px) instead of cpsam")
         try:
             masks = segment_nuclei_watershed(blue_channel, diameter)
             num_nuclei = int(masks.max())
-            # Separar cúmulos y rescatar núcleos difusos (igual que la ruta CellPose)
+            # split clumps and rescue diffuse nuclei, as on the CellPose path
             try:
                 masks = _split_merged_nuclei(masks, diameter)
                 num_nuclei = int(masks.max())
             except Exception as e:
-                print(f"[Split] Falló: {e}, manteniendo máscaras sin separar")
+                print(f"[Split] failed: {e}, keeping unsplit masks")
             try:
                 masks = _rescue_missed_nuclei(masks, blue_channel, diameter)
                 num_nuclei = int(masks.max())
             except Exception as e:
-                print(f"[Rescate] Falló: {e}, manteniendo máscaras sin rescate")
-            print(f"[CPU-Rápido] ✓ Segmentación final: {num_nuclei} núcleos detectados")
+                print(f"[Rescue] failed: {e}, keeping masks without rescue")
+            print(f"[CPU-fast] {num_nuclei} nuclei")
             return masks.astype(np.int32)
         except Exception as e:
-            print(f"[CPU-Rápido] ⚠ Watershed falló ({e}), usando CellPose como respaldo...")
-            # Si falla, continúa con la ruta CellPose normal de abajo
+            print(f"[CPU-fast] watershed failed ({e}), falling back to CellPose...")
+            # if it fails, fall through to the normal CellPose path below
 
-    print(f"[CellPose] Parámetros: diameter={diameter}, flow_thr={flow_threshold}, cellprob_thr={cellprob_threshold}")
+    print(f"[CellPose] diameter={diameter}, flow_thr={flow_threshold}, cellprob_thr={cellprob_threshold}")
     
     model = _get_cellpose_model()
 
-    # ── Aceleración CPU: reducir resolución para la segmentación de núcleos ──
-    # CellPose corre sobre la versión reducida; el diámetro se escala igual.
-    # En GPU o imágenes pequeñas, factor=1.0 (sin cambios).
+    # CPU speed-up: run CellPose on a downscaled copy, diameter scaled too
+    # (factor is 1.0 on GPU or for small images)
     ds_factor = _compute_downscale_factor(blue_channel.shape, diameter, USE_GPU)
     if ds_factor < 0.999:
         seg_input, _orig_shape = _downscale_for_nuclei(blue_channel, ds_factor)
-        # diámetro escalado, con suelo de 16px (cpsam funciona bien desde ~15px)
+        # scaled diameter, floor of 16 px (cpsam is fine from ~15 px)
         seg_diameter = max(16, int(round(diameter * ds_factor)))
-        print(f"[Acelera-CPU] Núcleos a {ds_factor:.2f}x: "
-              f"{blue_channel.shape}→{seg_input.shape}, diámetro {diameter}→{seg_diameter}px")
+        print(f"[CPU-speedup] nuclei at {ds_factor:.2f}x: "
+              f"{blue_channel.shape} -> {seg_input.shape}, diameter {diameter} -> {seg_diameter}px")
     else:
         seg_input, _orig_shape = blue_channel, blue_channel.shape
         seg_diameter = diameter
 
     try:
-        # Primer intento con los parámetros dados (compatible 2.x/4.x)
+        # first pass with the given parameters
         masks = _eval_cellpose(model, seg_input, seg_diameter,
                                flow_threshold, cellprob_threshold)
         num_nuclei = int(masks.max())
-        print(f"[CellPose] Intento 1 (cellprob={cellprob_threshold}, flow={flow_threshold}): {num_nuclei} núcleos")
+        print(f"[CellPose] pass 1 (cellprob={cellprob_threshold}, flow={flow_threshold}): {num_nuclei} nuclei")
 
-        # Estimar cuántos núcleos esperamos por detección clásica
-        # (la estimación clásica usa la imagen reducida también, para coherencia)
+        # how many nuclei do we expect, from the classic count?
+        # (on the downscaled image too, so both numbers are comparable)
         expected = _count_nuclei_classic_safe(seg_input, seg_diameter)
-        print(f"[CellPose] Núcleos esperados (estimación clásica): ~{expected}")
+        print(f"[CellPose] expected nuclei (classic estimate): ~{expected}")
 
-        # RE-INTENTO ÚNICO ADAPTATIVO: si CellPose detecta menos de lo esperado,
-        # un solo reintento con cellprob bajo recupera núcleos tenues.
-        # (Antes probaba -1,-2,-3 = hasta 3 pasadas extra. Una sola pasada bien
-        #  elegida captura casi lo mismo a una fracción del tiempo en CPU.)
+        # One adaptive retry: if CellPose finds fewer nuclei than expected, a
+        # second pass with a lower cellprob picks up the faint ones.
+        # (An earlier version tried -1, -2 and -3; one well-chosen pass gets
+        #  almost the same nuclei for a fraction of the CPU time.)
         if expected > 0 and num_nuclei < expected * 0.90:
             retry_thr = min(-2.0, cellprob_threshold - 1.0)
-            print(f"[CellPose] Detección baja ({num_nuclei}<{int(expected*0.90)}), "
-                  f"reintento único cellprob={retry_thr}...")
+            print(f"[CellPose] low count ({num_nuclei}<{int(expected*0.90)}), "
+                  f"retrying once with cellprob={retry_thr}...")
             try:
                 m2 = _eval_cellpose(model, seg_input, seg_diameter,
                                     flow_threshold, retry_thr)
                 n2 = int(m2.max())
-                print(f"[CellPose]   → {n2} núcleos")
+                print(f"[CellPose]   -> {n2} nuclei")
                 if n2 > num_nuclei and n2 <= max(expected * 1.5, num_nuclei + 1):
                     masks, num_nuclei = m2, n2
             except Exception as e:
-                print(f"[CellPose]   reintento falló: {e}")
+                print(f"[CellPose]   retry failed: {e}")
 
-        # Reescalar la máscara al tamaño original ANTES de watershed/split/rescate
-        # (esos pasos trabajan sobre el canal azul en resolución completa)
+        # back to full resolution before split/rescue, which work on the
+        # full-resolution nuclear channel
         if ds_factor < 0.999:
             masks = _upscale_mask(masks, blue_channel.shape)
             num_nuclei = int(masks.max())
-            print(f"[Acelera-CPU] Máscara reescalada a {blue_channel.shape}: {num_nuclei} núcleos")
+            print(f"[CPU-speedup] mask rescaled to {blue_channel.shape}: {num_nuclei} nuclei")
 
-        # Fallback watershed solo si seguimos MUY por debajo
-        # (se recalcula expected en resolución completa para comparar bien)
+        # watershed fallback only if we are still far below the expected count
+        # (expected count recomputed at full resolution)
         expected_full = _count_nuclei_classic_safe(blue_channel, diameter)
         if expected_full > 0 and num_nuclei < expected_full * 0.80:
-            print(f"[CellPose] Aún baja ({num_nuclei}), probando WATERSHED...")
+            print(f"[CellPose] still low ({num_nuclei}), trying watershed...")
             try:
                 ws_masks = segment_nuclei_watershed(blue_channel, diameter)
                 num_ws = int(ws_masks.max())
-                print(f"[Watershed] {num_ws} núcleos vs CellPose {num_nuclei}")
+                print(f"[Watershed] {num_ws} nuclei vs CellPose {num_nuclei}")
                 if num_ws > num_nuclei:
                     masks = ws_masks
                     num_nuclei = num_ws
-                    print(f"[CellPose] ✓ Usando WATERSHED (mejor detección de núcleos tenues)")
+                    print("[CellPose] using the watershed result (better for faint nuclei)")
             except Exception as e:
-                print(f"[Watershed] Falló: {e}, manteniendo CellPose")
+                print(f"[Watershed] failed: {e}, keeping CellPose")
 
-        # SEPARAR CÚMULOS: parte núcleos pegados que quedaron como una sola máscara
+        # split clumps that ended up as a single mask
         try:
             masks = _split_merged_nuclei(masks, diameter)
             num_nuclei = int(masks.max())
         except Exception as e:
-            print(f"[Split] Falló: {e}, manteniendo máscaras sin separar")
+            print(f"[Split] failed: {e}, keeping unsplit masks")
 
-        # RESCATE: recuperar núcleos difusos/irregulares que CellPose descartó
-        # por forma (no por brillo). cellprob más bajo no los recupera.
+        # rescue diffuse or irregular nuclei that CellPose dropped for their
+        # shape (a lower cellprob does not bring them back)
         try:
             masks = _rescue_missed_nuclei(masks, blue_channel, diameter)
             num_nuclei = int(masks.max())
         except Exception as e:
-            print(f"[Rescate] Falló: {e}, manteniendo máscaras sin rescate")
+            print(f"[Rescue] failed: {e}, keeping masks without rescue")
 
-        print(f"[CellPose] ✓ Segmentación final: {num_nuclei} núcleos detectados")
+        print(f"[CellPose] {num_nuclei} nuclei")
         
         if num_nuclei == 0:
-            print("[CellPose] ⚠ WARNING: NO se detectaron núcleos")
+            print("[CellPose] warning: no nuclei detected")
             print("           Sugerencias:")
-            print("           - Prueba cellprob_threshold más bajo (-1.0, -2.0)")
-            print("           - Ajusta diameter (40-100 según tamaño de núcleos)")
+            print("           - try a lower cellprob_threshold (-1.0, -2.0)")
+            print("           - adjust diameter (40-100 depending on nucleus size)")
         
         return masks.astype(np.int32)
         
     except Exception as e:
-        print(f"[CellPose] ✗ ERROR durante segmentación: {e}")
+        print(f"[CellPose] segmentation error: {e}")
         raise
 
 
-# ─── CellPose Amastigote Detection ────────────────────────────────────────────
+# --- amastigote detection with CellPose ---
 _CELLPOSE_CYTO_MODEL = None
 _CELLPOSE_CYTO_GPU   = None
 
 def _get_cellpose_cyto_model():
-    """Carga (y cachea) el modelo cyto para detectar amastigotes."""
+    """Load (and cache) the CellPose model used for amastigotes."""
     global _CELLPOSE_CYTO_MODEL, _CELLPOSE_CYTO_GPU
     if _CELLPOSE_CYTO_MODEL is None or _CELLPOSE_CYTO_GPU != USE_GPU:
         from cellpose import models
-        print(f"[CellPose-Amas] Cargando modelo cyto (GPU: {USE_GPU})...")
+        print(f"[CellPose-Amas] loading model (GPU: {USE_GPU})...")
         if _cellpose_is_v4():
-            # 4.x: un único modelo cpsam sirve para todo (núcleos y amastigotes)
+            # 4.x: the single cpsam model handles nuclei and amastigotes
             _CELLPOSE_CYTO_MODEL = models.CellposeModel(gpu=USE_GPU)
             _CELLPOSE_CYTO_GPU   = USE_GPU
-            print("[CellPose-Amas] ✓ Modelo cpsam (4.x) cargado")
+            print("[CellPose-Amas] loaded cpsam (4.x)")
         else:
             for mtype in ("cyto3", "cyto2", "cyto"):
                 try:
                     _CELLPOSE_CYTO_MODEL = models.Cellpose(gpu=USE_GPU, model_type=mtype)
                     _CELLPOSE_CYTO_GPU   = USE_GPU
-                    print(f"[CellPose-Amas] ✓ Modelo '{mtype}' cargado")
+                    print(f"[CellPose-Amas] loaded '{mtype}'")
                     break
                 except Exception as e:
-                    print(f"[CellPose-Amas] ⚠ '{mtype}' no disponible: {e}")
+                    print(f"[CellPose-Amas] '{mtype}' not available: {e}")
         if _CELLPOSE_CYTO_MODEL is None:
-            raise RuntimeError("No se pudo cargar ningún modelo cyto para amastigotes")
+            raise RuntimeError("Could not load any CellPose model for amastigotes")
     return _CELLPOSE_CYTO_MODEL
 
 
@@ -761,14 +735,13 @@ def detect_amastigotes_cellpose(amas_channel: np.ndarray,
                                  min_size: int = 2,
                                  max_size: int = 150,
                                  expected_diameter: int = None) -> tuple:
-    """
-    Detecta amastigotes usando CellPose (modelo cyto).
+    """Detect amastigotes with CellPose.
 
-    Ideal cuando los amastigotes están separados y tienen morfología de célula
-    pequeña. Filtra por forma, no solo por brillo → menos falsos positivos.
-
-    Devuelve (sparse_mask, dense_mask, dense_analysis) igual que detect_amastigotes,
-    o None si CellPose no detectó nada (el caller hace fallback al método clásico).
+    Works best when parasites are well separated: it filters by shape, not
+    only by brightness, so there are fewer false positives. Returns
+    (sparse_mask, dense_mask, dense_analysis) like detect_amastigotes, or
+    None if nothing was found (the caller then falls back to the classic
+    method).
     """
     from skimage import measure
     import numpy as np
@@ -783,7 +756,7 @@ def detect_amastigotes_cellpose(amas_channel: np.ndarray,
     print(f"[CellPose-Amas] diameter={expected_diameter}, mean={mean_val:.1f}, std={std_val:.1f}")
 
     if std_val < 1.0 or arr.max() == 0:
-        print("[CellPose-Amas] Canal vacío — skipping")
+        print("[CellPose-Amas] empty channel, skipping")
         return None
 
     try:
@@ -795,7 +768,7 @@ def detect_amastigotes_cellpose(amas_channel: np.ndarray,
         return None
 
     n_detected = int(masks.max())
-    print(f"[CellPose-Amas] Detectados: {n_detected} objetos")
+    print(f"[CellPose-Amas] {n_detected} objects detected")
     if n_detected == 0:
         return None
 
@@ -819,7 +792,7 @@ def detect_amastigotes_cellpose(amas_channel: np.ndarray,
 
     sparse_mask = np.where(keep[masks], masks, 0).astype(np.int32)
     n_sparse = int(sparse_mask.max())
-    print(f"[CellPose-Amas] Filtrado: {n_sparse} sparse, {len(dense_regions_list)} densos")
+    print(f"[CellPose-Amas] {n_sparse} sparse, {len(dense_regions_list)} dense")
 
     if n_sparse == 0 and not dense_regions_list:
         return None
@@ -850,10 +823,10 @@ def detect_amastigotes_cellpose(amas_channel: np.ndarray,
 
 
 def _should_use_cellpose_for_amastigotes(amas_channel: np.ndarray) -> bool:
-    """
-    Heurística para el modo 'auto':
-    - Señal densa (>12% del área) → método clásico (más robusto con masas)
-    - Señal dispersa              → CellPose (más preciso con objetos separados)
+    """Choose the detector in 'auto' mode.
+
+    Dense signal (>12% of the area) -> classic method, more robust with
+    masses; sparse signal -> CellPose, more precise with separate objects.
     """
     from skimage import filters
     arr = amas_channel.astype(np.float32)
@@ -863,25 +836,22 @@ def _should_use_cellpose_for_amastigotes(amas_channel: np.ndarray) -> bool:
     thr = float(np.percentile(smoothed, 95))
     signal_fraction = float((smoothed > thr).sum()) / float(smoothed.size)
     if signal_fraction > 0.12:
-        print(f"[Auto-modo] Señal densa ({signal_fraction*100:.1f}%) → CLÁSICO")
+        print(f"[Auto mode] dense signal ({signal_fraction*100:.1f}%) -> classic")
         return False
-    print(f"[Auto-modo] Señal dispersa ({signal_fraction*100:.1f}%) → CELLPOSE")
+    print(f"[Auto mode] sparse signal ({signal_fraction*100:.1f}%) -> CellPose")
     return True
 
 
-# ─── Amastigote Detection ──────────────────────────────────────────────────────
+# --- amastigote detection (classic) ---
 def detect_amastigotes(red_channel: np.ndarray,
                        min_size: int = 2,
                        max_size: int = 150,
                        threshold_method: str = "otsu"):
-    """
-    v10: detección sensible + separación simple discreto/denso.
+    """Sensitive amastigote detection with a simple sparse/dense split.
 
-    Idea clave:
-    - Mantener la sensibilidad de la versión nueva para no perder puntos rojos.
-    - No contar por área salvo que el componente sea una masa densa real.
-    - Los puntos sueltos/pequeños clusters pasan a `sparse_mask` y se contarán
-      después como objetos discretos o por picos locales capados.
+    Small spots and small clusters go to sparse_mask and are counted later
+    as discrete objects. Only components that are really dense masses go
+    to dense_mask and are estimated from their area.
     """
     from skimage import filters, morphology, measure
 
@@ -890,7 +860,7 @@ def detect_amastigotes(red_channel: np.ndarray,
     std_val  = float(arr.std())
     max_val  = float(arr.max())
 
-    print(f"[Detección v12] Canal rojo — mean={mean_val:.1f}, std={std_val:.1f}, max={max_val:.1f}")
+    print(f"[Detection] red channel: mean={mean_val:.1f}, std={std_val:.1f}, max={max_val:.1f}")
 
     def _empty_analysis(thresh=0.0):
         empty = np.zeros_like(red_channel, dtype=np.int32)
@@ -920,8 +890,8 @@ def detect_amastigotes(red_channel: np.ndarray,
     if max_val <= 0 or std_val < 0.5:
         return _empty_analysis(0.0)
 
-    # Realce rápido de puntos/masas sobre fondo: conserva más amastigotes que el
-    # umbral clásico, pero no fusiona mediante cierres morfológicos agresivos.
+    # quick top-hat style enhancement of spots over the background: keeps
+    # more amastigotes than a plain threshold without merging them
     sigma_bg = max(3, min(10, int(min(arr.shape) * 0.006)))
     bg = filters.gaussian(arr, sigma=sigma_bg, preserve_range=True)
     enhanced = arr - bg
@@ -954,19 +924,19 @@ def detect_amastigotes(red_channel: np.ndarray,
     method_map = {"otsu": thresh_otsu, "triangle": thresh_tri, "yen": thresh_yen}
     method_thr = method_map.get(threshold_method, thresh_otsu)
 
-    # Sensible, pero con piso para no incluir ruido/halo débil.
-    # v13: piso y factor rebajados para capturar amastigotes de brillo MEDIO
-    # (los que tienen algo de fluorescencia azul mezclada y por tanto su señal
-    # roja es más tenue). Antes floor=p95*0.50 y otsu*0.78 anclaban el umbral a
-    # los amastigotes más brillantes y dejaban fuera ~15% de brillo medio.
-    # El filtro remove_small_objects de más abajo sigue eliminando el ruido,
-    # así que bajar el umbral es seguro.
+    # sensitive, but with a floor so faint halo and noise stay out
+    # The floor and factor were lowered to catch medium-brightness
+    # amastigotes (those mixed with some blue fluorescence, whose red
+    # signal is weaker). With floor = p95 * 0.50 and otsu * 0.78 the
+    # threshold was anchored to the brightest parasites and ~15% were lost.
+    # remove_small_objects below still removes the noise, so the lower
+    # threshold is safe.
     floor = max(p95 * 0.35, float(smoothed.max()) * 0.035, 1.0)
     thresh_final = max(method_thr * 0.65, floor)
     thresh_final = min(thresh_final, max(p99 * 0.92, floor))
 
-    print(f"[Detección v12] Candidatos — stat={stat:.1f}, otsu={thresh_otsu:.1f}, triangle={thresh_tri:.1f}, yen={thresh_yen:.1f}, p95={p95:.1f}, p99={p99:.1f}")
-    print(f"[Detección v12] Umbral FINAL: {thresh_final:.1f}")
+    print(f"[Detection] candidates: stat={stat:.1f}, otsu={thresh_otsu:.1f}, triangle={thresh_tri:.1f}, yen={thresh_yen:.1f}, p95={p95:.1f}, p99={p99:.1f}")
+    print(f"[Detection] final threshold: {thresh_final:.1f}")
 
     binary = smoothed > thresh_final
     binary = morphology.remove_small_objects(binary, min_size=max(1, int(min_size)))
@@ -976,7 +946,7 @@ def detect_amastigotes(red_channel: np.ndarray,
     if not regions:
         return _empty_analysis(thresh_final)
 
-    # Calibración para distinguir tamaño unitario, NO para contar puntos sueltos.
+    # calibration estimates the single-parasite size; it does not count
     small_upper = min(90, max(35, int(max_size * 0.65)))
     candidate_areas = []
     for r in regions:
@@ -1003,8 +973,8 @@ def detect_amastigotes(red_channel: np.ndarray,
             avg_area = float(np.median(filtered))
             std_dev = float(np.std(filtered))
             cv = std_dev / avg_area if avg_area > 0 else None
-            # Aceptamos tamaños más pequeños que en v9 para no perder detección,
-            # pero no permitimos que un valor diminuto infle masas densas.
+            # Smaller sizes than before are accepted so detection is not lost,
+            # but a tiny value must not inflate the estimate for dense masses.
             if avg_area < 4.5 or (cv is not None and cv > 1.05):
                 avg_area = None
                 std_dev = None
@@ -1045,8 +1015,8 @@ def detect_amastigotes(red_channel: np.ndarray,
 
     unit_for_thresholds = float(avg_area) if avg_area is not None else 12.0
 
-    # Separación simple: solo los componentes claramente grandes van a dense_mask.
-    # El umbral es más alto que v8 para que 24 hpi con puntos sueltos no active masas.
+    # only clearly large components go to dense_mask; the cut-off is high
+    # enough that sparse spots (e.g. at 24 hpi) never count as masses
     candidate_dense_area = max(int(max_size) * 3, int(unit_for_thresholds * 38), 600)
     true_dense_min_area  = max(int(unit_for_thresholds * 110), 1600)
 
@@ -1073,11 +1043,11 @@ def detect_amastigotes(red_channel: np.ndarray,
     dense_mask = dense_mask.astype(bool)
 
     if avg_area is not None:
-        print(f"[Calibración v12] AUTO aceptada: {avg_area:.1f}px², n={n_filtered}, cv={cv if cv is not None else 0:.2f}, confianza={confidence_level}")
+        print(f"[Calibration] accepted: {avg_area:.1f}px^2, n={n_filtered}, cv={cv if cv is not None else 0:.2f}, confidence={confidence_level}")
     else:
-        print(f"[Calibración v12] AUTO no usada para masas (n={n_total}). Conteo discreto protegido.")
+        print(f"[Calibration] not used for masses (n={n_total}); discrete counting only")
 
-    print(f"[Detección v12] Sparse labels={int(sparse_mask.max())}, candidatos densos={len(dense_regions_list)}, dense_area≥{candidate_dense_area}px², masa real≥{true_dense_min_area}px²")
+    print(f"[Detection] sparse labels={int(sparse_mask.max())}, dense candidates={len(dense_regions_list)}, dense_area>={candidate_dense_area}px^2, true mass>={true_dense_min_area}px^2")
 
     dense_analysis = {
         'regions': dense_regions_list,
@@ -1104,21 +1074,17 @@ def detect_amastigotes(red_channel: np.ndarray,
     return sparse_mask, dense_mask, dense_analysis
 
 
-"""
-Función adicional para separar clusters en calibración
-Insertar después de detect_amastigotes
-"""
+"""Watershed splitting of amastigote clusters for calibration."""
 
 
-# ─── Watershed para separar clusters ───────────────────────────────────────────
+# --- watershed to split clusters ---
 def separate_amastigote_clusters(sparse_mask: np.ndarray, 
                                  red_channel: np.ndarray,
                                  expected_size: float = 13) -> np.ndarray:
-    """
-    Separa clusters claros de amastigotes pegados usando watershed.
+    """Split clusters of touching amastigotes with a watershed.
 
-    v7: más conservador para no dividir ruido pequeño y para acelerar.
-    Solo intenta separar objetos claramente mayores que un amastigote individual.
+    Conservative: only objects clearly larger than one amastigote are
+    split, so small noise is left alone (and it is faster).
     """
     from skimage import measure, segmentation
     from skimage.feature import peak_local_max
@@ -1142,7 +1108,7 @@ def separate_amastigote_clusters(sparse_mask: np.ndarray,
             distance = ndimage.distance_transform_edt(roi_mask)
             min_distance = max(2, int(np.sqrt(max(expected_size, 4))))
 
-            # Primero intentamos máximos en señal; si no hay suficientes, usamos distancia.
+            # signal maxima first; distance transform if there are not enough
             vals = roi_signal[roi_mask]
             if vals.size:
                 thr = max(float(np.percentile(vals, 65)), float(vals.max()) * 0.35)
@@ -1198,7 +1164,7 @@ def separate_amastigote_clusters(sparse_mask: np.ndarray,
     return separated_mask
 
 
-# ─── Infection Criterion ──────────────────────────────────────────────────────
+# --- infection criterion ---
 def compute_infection(nucleus_mask: np.ndarray,
                       sparse_mask: np.ndarray,
                       dense_mask: np.ndarray,
@@ -1206,15 +1172,14 @@ def compute_infection(nucleus_mask: np.ndarray,
                       dilation_radius: int = 100,
                       min_amastigotes: int = 1,
                       avg_amastigote_size: int = 15) -> dict:
-    """
-    v12: detección/asignación nuevas + conteo fino conservador.
+    """Assign parasites to cells and count them.
 
-    - Asigna cada señal roja al núcleo más cercano con KDTree.
-    - Puntos sueltos: 1 componente = 1 amastigote.
-    - Clusters no densos: se estiman por máximos locales, capados para no saltar
-      artificialmente a >50.
-    - Masa densa real: solo si el componente es muy grande y ocupa una fracción
-      relevante del territorio celular; entonces se estima por área calibrada.
+    - Each red object is assigned to the nearest nucleus (KD-tree).
+    - Isolated spots count as one amastigote each.
+    - Non-dense clusters are counted from local maxima, capped so they do
+      not jump artificially above 50.
+    - Only real dense masses (very large and covering a relevant part of
+      the cell territory) are estimated from the calibrated area.
     """
     from skimage import measure
     from skimage.feature import peak_local_max
@@ -1242,7 +1207,7 @@ def compute_infection(nucleus_mask: np.ndarray,
     nuc_areas = {int(p.label): int(p.area) for p in nuc_props}
     tree = cKDTree(nuc_centroid_arr)
 
-    # ── Calibración efectiva: solo para clusters/masas, nunca para puntos sueltos ──
+    # effective calibration: only for clusters and masses, never for spots
     detected_size = dense_analysis.get('avg_sparse_amastigote_area')
     confidence = dense_analysis.get('calibration_confidence', 'none')
     n_valid = int(dense_analysis.get('n_sparse_used_for_calibration', 0) or 0)
@@ -1261,15 +1226,15 @@ def compute_infection(nucleus_mask: np.ndarray,
         calibration_source = "default"
         calibration_confidence = "fallback"
 
-    # Protección anti-sobreconteo: para estimar masas, nunca dividir por valores minúsculos.
+    # guard against overcounting: never divide by a tiny unit size
     sparse_unit = max(float(effective_amas_size), 8.0)
     dense_unit = max(float(effective_amas_size) * 1.45, 16.0)
     candidate_dense_area = int(dense_analysis.get('candidate_dense_area') or max(600, sparse_unit * 38))
     true_dense_min_area = int(dense_analysis.get('true_dense_min_area') or max(1600, sparse_unit * 110))
 
-    print(f"[Conteo v12] Calibración {calibration_source}: unit={effective_amas_size:.1f}px²; sparse_unit={sparse_unit:.1f}; dense_unit={dense_unit:.1f}")
+    print(f"[Count] calibration {calibration_source}: unit={effective_amas_size:.1f}px^2; sparse_unit={sparse_unit:.1f}; dense_unit={dense_unit:.1f}")
 
-    # Territorio aproximado por célula para validar masas densas sin distance_transform global.
+    # rough territory per cell, used to validate dense masses
     if len(nuc_props) > 1:
         nn_dists, _ = tree.query(nuc_centroid_arr, k=2)
         nearest_neighbor = nn_dists[:, 1]
@@ -1277,26 +1242,26 @@ def compute_infection(nucleus_mask: np.ndarray,
         nearest_neighbor = np.array([2 * dilation_radius], dtype=float)
 
     territory_area = np.zeros(n_nuclei + 1, dtype=float)
-    # Radio máximo de asignación por núcleo: borde del núcleo + margen de citosol.
-    # Un amastigote más lejos que esto es "libre" y NO se asigna.
+    # Maximum assignment radius per nucleus: nucleus edge + cytoplasm margin.
+    # An amastigote further away is "free" and is not assigned.
     max_assign_radius = np.zeros(n_nuclei + 1, dtype=float)
     for i, lbl in enumerate(nuc_labels):
         local_r = min(float(dilation_radius), max(18.0, float(nearest_neighbor[i]) * 0.55))
         territory_area[int(lbl)] = float(nuc_areas.get(int(lbl), 0)) + np.pi * local_r * local_r
-        # Radio del núcleo a partir de su área real
+        # nucleus radius from its real area
         nuc_area = float(nuc_areas.get(int(lbl), 200))
         nuc_radius = np.sqrt(nuc_area / np.pi)
-        # Margen de citosol: hasta dónde se asignan amastigotes alrededor del núcleo.
-        # En T. cruzi los amastigotes llenan el citoplasma formando un anillo que se
-        # extiende ~1.5x el radio del núcleo. Antes el margen era nearest_neighbor*0.6,
-        # demasiado corto: dejaba fuera el anillo de células claramente infectadas
-        # (p.ej. la 49) y las marcaba como sanas.
+        # Cytoplasm margin: how far from the nucleus amastigotes are assigned.
+        # In T. cruzi the amastigotes fill the cytoplasm as a ring that reaches
+        # ~1.5x the nucleus radius. The old margin (nearest_neighbor * 0.6) was
+        # too short: it missed that ring in clearly infected cells and marked
+        # them as uninfected.
         #
-        # Nueva lógica:
-        #   - suelo biológico: 1.5 x radio del núcleo (cubre el citoplasma típico)
-        #   - techo por vecino: nearest_neighbor * 0.75 (no invadir células contiguas)
-        #   - el margen final respeta el suelo aunque el vecino esté cerca, pero
-        #     nunca supera dilation_radius.
+        # Current rule:
+        #   - biological floor: 1.5 x nucleus radius (typical cytoplasm)
+        #   - neighbour cap: nearest_neighbor * 0.75 (stay out of adjacent cells)
+        #   - the final margin keeps the floor even when a neighbour is close,
+        #     but never exceeds dilation_radius.
         cito_floor = nuc_radius * 1.5
         nbr_limit  = float(nearest_neighbor[i]) * 0.75
         cito_margin = max(cito_floor, nbr_limit)
@@ -1307,8 +1272,8 @@ def compute_infection(nucleus_mask: np.ndarray,
         cy, cx = reg.centroid
         dist, idx = tree.query([float(cy), float(cx)], k=1)
         owner = int(nuc_labels[int(idx)])
-        # Solo asignar si el amastigote está dentro del radio de esa célula.
-        # Si está más lejos → amastigote libre en el fondo, NO se asigna.
+        # only assign if the amastigote is within that cell's radius;
+        # anything further away is free background signal
         if float(dist) <= float(max_assign_radius[owner]):
             return owner
         return 0
@@ -1329,12 +1294,11 @@ def compute_infection(nucleus_mask: np.ndarray,
 
     def _local_peaks(label_img: np.ndarray, reg, min_distance: int = 4,
                      percentile: float = 78, max_peaks: int = 80) -> int:
-        """Detecta máximos brillantes, pero con parámetros conservadores.
+        """Bright local maxima, with conservative parameters.
 
-        En v10 los máximos locales podían multiplicarse dentro de un mismo
-        amastigote al usar min_distance=3 y percentiles bajos. Esta versión se
-        usa solo como respaldo: el conteo principal viene de núcleos brillantes
-        separados por umbral local alto.
+        Only a fallback: with min_distance=3 and low percentiles, maxima
+        used to multiply inside a single amastigote. The main count comes
+        from bright cores separated by a high local threshold.
         """
         bbox = reg.bbox
         sl = (slice(bbox[0], bbox[2]), slice(bbox[1], bbox[3]))
@@ -1346,7 +1310,7 @@ def compute_infection(nucleus_mask: np.ndarray,
         if vals.size == 0 or float(vals.max()) <= 0:
             return 0
 
-        # Umbral alto para no sacar varios picos dentro de un mismo punto.
+        # high threshold so one spot does not give several peaks
         thr = max(float(np.percentile(vals, percentile)), float(vals.max()) * 0.45)
         try:
             coords = peak_local_max(
@@ -1362,13 +1326,12 @@ def compute_infection(nucleus_mask: np.ndarray,
             return 0
 
     def _count_bright_cores(label_img: np.ndarray, reg) -> int:
-        """Cuenta amastigotes visibles como centros brillantes separados.
+        """Count visible amastigotes as separate bright centres.
 
-        Ajuste v12: para señal discreta NO se usa
-        área / tamaño medio, porque eso infla mucho los valores cuando el halo o
-        el suavizado hacen que 2 puntos formen un componente grande. En su lugar
-        se subumbraliza cada componente con un umbral local alto; así dos puntos
-        pegados siguen siendo dos, no 12-14.
+        For discrete signal, area / mean size is not used: halo and smoothing
+        can merge 2 spots into one large component, which then counted as
+        12-14. Instead each component is re-thresholded with a high local
+        threshold, so two touching spots stay two.
         """
         from skimage import measure, morphology
 
@@ -1384,9 +1347,9 @@ def compute_infection(nucleus_mask: np.ndarray,
             return 0
 
         vmax = float(vals.max())
-        # v12: umbral local más alto. En v11 un único punto con halo podía
-        # partirse en dos cores y duplicar el conteo. Aquí nos quedamos con el
-        # centro realmente brillante y exigimos cores algo más sólidos.
+        # High local threshold: a single spot with a halo could otherwise split
+        # into two cores and double the count. Keep only the really bright
+        # centre and require reasonably solid cores.
         q86 = float(np.percentile(vals, 86))
         q92 = float(np.percentile(vals, 92))
         thr_core = max(q86, q92 * 0.92, vmax * 0.62)
@@ -1403,9 +1366,9 @@ def compute_infection(nucleus_mask: np.ndarray,
         if not core_props:
             return 0
 
-        # Filtrar cores diminutos: un solo amastigote puede tener 1-2 píxeles
-        # máximos separados por ruido. Solo cuentan como centros independientes
-        # los cores con área suficiente o brillo claramente dominante.
+        # Drop tiny cores: one amastigote can have 1-2 maximal pixels
+        # separated by noise. Only cores with enough area or clearly
+        # dominant brightness count as independent centres.
         valid = []
         for cp in core_props:
             imax = float(getattr(cp, 'intensity_max', 0.0))
@@ -1415,21 +1378,20 @@ def compute_infection(nucleus_mask: np.ndarray,
         return int(len(valid))
 
     def _count_discrete_component(label_img: np.ndarray, reg) -> int:
-        """Cuenta puntos/clusters no densos con un modelo realista.
+        """Count sparse spots and clusters.
 
-        Regla v12:
-        - Punto pequeño: 1.
-        - Cluster discreto: número de centros brillantes separados.
-        - Nunca dividir área entre tamaño de amastigote para señal discreta.
-          Esa división era la causa de contar 2 puntos como 14.
-        - Solo las masas densas verdaderas, validadas más abajo, se estiman por
-          área y pueden entrar en 15-50 o >50.
+        - small spot: 1
+        - discrete cluster: number of separate bright centres
+        - area is never divided by the amastigote size for discrete signal
+          (that was what turned 2 spots into 14)
+        - only true dense masses, validated further down, are estimated from
+          area and can reach the 15-50 or >50 ranges
         """
         area = float(reg.area)
-        # v12: elevar el umbral de "un solo amastigote". En tus imágenes de
-        # 24hpi los puntos discretos tienen halo; en v11 ese halo hacía que un
-        # punto aislado pasara a contar 2. Ahora, todo componente pequeño cuenta
-        # como 1 salvo que sea claramente un cluster grande.
+        # Raise the "single amastigote" area. At 24 hpi the discrete spots
+        # have a halo, which used to make one isolated spot count as 2. Now
+        # every small component counts as 1 unless it is clearly a large
+        # cluster.
         min_single_area = max(3.4 * sparse_unit, 36.0)
 
         h = max(1, int(reg.bbox[2] - reg.bbox[0]))
@@ -1443,8 +1405,8 @@ def compute_infection(nucleus_mask: np.ndarray,
 
         cores = _count_bright_cores(label_img, reg)
         peaks = 0
-        # El respaldo por picos ahora es más estricto: solo se usa si el objeto
-        # es lo bastante grande/alargado para representar varios amastigotes.
+        # the peak-based fallback is stricter: only for objects large or
+        # elongated enough to hold several amastigotes
         if area > min_single_area * 1.05 or major_axis > diameter_guess * 1.8:
             peaks = _local_peaks(
                 label_img, reg,
@@ -1459,13 +1421,13 @@ def compute_infection(nucleus_mask: np.ndarray,
                 return 1 if area < min_single_area * 2.2 else 2
             return 3
 
-        # Cap geométrico estricto. Para rango 1-15 es mejor quedarse corto por
-        # 1 amastigote que convertir 2 puntos visibles en 4. Los clusters reales
-        # grandes siguen pudiendo subir a 15-50 por número de centros separados.
+        # Strict geometric cap. In the 1-15 range it is better to undercount
+        # by one than to turn 2 visible spots into 4. Real large clusters can
+        # still reach 15-50 through the number of separate centres.
         max_by_length = max(1, int(np.ceil(major_axis / diameter_guess)))
         max_by_area = max(1, int(np.ceil(area / max(28.0, sparse_unit * 3.2))))
         if minor_axis > diameter_guess * 1.7 and area > min_single_area * 2.5:
-            # cluster compacto bidimensional: permitir algo más que la longitud.
+            # compact 2-D cluster: allow a bit more than its length
             max_by_shape = max_by_area
         else:
             max_by_shape = max_by_length
@@ -1482,18 +1444,18 @@ def compute_infection(nucleus_mask: np.ndarray,
     counts_dense = np.zeros(n_nuclei + 1, dtype=int)
     dense_fraction_by_cell = np.zeros(n_nuclei + 1, dtype=float)
 
-    # ── 1) Discretos: asignación nueva, conteo protegido ───────────────────────
+    # 1) discrete objects: assignment and protected count
     amas_props = measure.regionprops(sparse_mask, intensity_image=det_img)
     assigned_sparse = 0
-    # Para la 2ª pasada (contigüidad): mapa label_amastigote → célula dueña,
-    # y lista de amastigotes que quedaron libres en la 1ª pasada.
-    owner_of_amas = {}          # reg.label → owner_id (solo asignados)
-    free_regions = []           # regiones sin dueño tras la 1ª pasada
+    # For the second (contiguity) pass: amastigote label -> owning cell,
+    # and the amastigotes left unassigned after the first pass.
+    owner_of_amas = {}          # reg.label -> owner_id (assigned only)
+    free_regions = []           # regions without an owner after pass 1
     for reg in amas_props:
         owner_id = _owner_from_region(reg)
         if owner_id == 0:
-            free_regions.append(reg)   # candidato para la 2ª pasada
-            continue  # amastigote libre en el fondo, de momento no se asigna
+            free_regions.append(reg)   # candidate for pass 2
+            continue  # free amastigote in the background, not assigned for now
         owner_of_amas[reg.label] = owner_id
         n_obj = _count_discrete_component(sparse_mask, reg)
         if n_obj <= 0:
@@ -1502,47 +1464,46 @@ def compute_infection(nucleus_mask: np.ndarray,
         counts_total[owner_id] += n_obj
         assigned_sparse += n_obj
 
-    # ── 1b) Segunda pasada por CONTIGÜIDAD ──────────────────────────────────────
-    # Un amastigote libre que está físicamente pegado a un cúmulo ya asignado a
-    # la célula X pertenece a esa misma infección (los amastigotes de una célula
-    # forman un cúmulo conectado). Esto recupera los amastigotes del borde externo
-    # del anillo sin asignar amastigotes realmente aislados en el fondo.
-    # Es robusto en todas las imágenes porque se basa en contigüidad real, no en
-    # un radio fijo que habría que calibrar por foto.
+    # 1b) second pass: contiguity
+    # A free amastigote touching a cluster already assigned to cell X
+    # belongs to the same infection (the parasites of one cell form a
+    # connected cluster). This recovers the outer edge of the ring
+    # without assigning parasites that are really isolated.
+    # It relies on actual contact rather than on a fixed radius that would
+    # need tuning for every image.
     if free_regions and owner_of_amas:
         from skimage import morphology as sk_morph
         from scipy import ndimage as sk_ndi
 
-        # Mapa de qué célula posee cada píxel de amastigote asignado.
+        # which cell owns each assigned amastigote pixel
         owner_pixels = np.zeros_like(sparse_mask, dtype=np.int32)
         for lbl_a, own in owner_of_amas.items():
             owner_pixels[sparse_mask == lbl_a] = own
 
-        # Distancia de contacto: proporcional al tamaño del amastigote unitario,
-        # de modo que se autoajusta a la escala de cada imagen. El factor 3.0 une
-        # amastigotes pegados al cúmulo (borde del anillo, separación ~1-1.5 diám.)
-        # pero NO puentea amastigotes realmente aislados en el fondo (separación
-        # grande), evitando asignaciones falsas. Calibrado sobre anillos típicos.
+        # Contact distance scales with the single-amastigote size, so it
+        # adapts to each image. A factor of 3.0 joins parasites touching the
+        # cluster (ring edge, ~1-1.5 diameters apart) but does not bridge to
+        # really isolated ones further out, which would be false assignments.
         link_dist = max(3, int(round(np.sqrt(max(sparse_unit, 4.0) / np.pi) * 3.0)))
         struct = sk_morph.disk(link_dist)
 
-        # Resolvemos en varias iteraciones: un amastigote recién unido puede a su
-        # vez "puentear" hacia otro libre más externo (cadena del anillo).
+        # Several iterations: a newly joined amastigote can in turn bridge to
+        # another free one further out (a chain along the ring).
         changed = True
         passes = 0
         while changed and passes < 4 and free_regions:
             changed = False
             passes += 1
             still_free = []
-            # Dilatamos el mapa de dueños para detectar contacto.
+            # dilate the owner map to detect contact
             owner_dil = sk_ndi.grey_dilation(owner_pixels, footprint=struct)
             for reg in free_regions:
                 coords = reg.coords
-                # Etiquetas de célula tocadas alrededor de este amastigote libre.
+                # cell labels touched around this free amastigote
                 touched = owner_dil[coords[:, 0], coords[:, 1]]
                 touched = touched[touched > 0]
                 if touched.size > 0:
-                    # Dueño = célula mayoritaria en el contacto.
+                    # owner = majority cell in the contact zone
                     vals, cnts = np.unique(touched, return_counts=True)
                     own = int(vals[int(np.argmax(cnts))])
                     owner_of_amas[reg.label] = own
@@ -1557,15 +1518,15 @@ def compute_infection(nucleus_mask: np.ndarray,
                     still_free.append(reg)
             free_regions = still_free
 
-    # ── 1c) Tercera pasada: VECINO MÁS CERCANO con tope de distancia ───────────
-    # Los amastigotes que siguen libres tras contigüidad suelen estar en el
-    # espacio intercelular, claramente más cerca de UNA célula pero un poco
-    # fuera de su radio estricto. Se asignan al núcleo más cercano siempre que
-    # estén dentro de una distancia ampliada razonable (1.6x el radio de
-    # asignación de ese núcleo). Amastigotes verdaderamente perdidos en el fondo
-    # (más lejos que eso) siguen sin asignarse, evitando falsos positivos.
+    # 1c) third pass: nearest nucleus, with a distance cap
+    # Amastigotes still free after the contiguity pass usually sit in the
+    # space between cells, clearly closer to ONE cell but just outside its
+    # strict radius. They go to the nearest nucleus if they are within an
+    # extended distance (1.6x that nucleus's assignment radius). Parasites
+    # really lost in the background (further than that) stay unassigned,
+    # which avoids false positives.
     if free_regions:
-        EXTEND = 1.6   # cuánto se amplía el radio estricto en esta última pasada
+        EXTEND = 1.6   # how much the strict radius is extended in this last pass
         still_free = []
         for reg in free_regions:
             cy, cx = reg.centroid
@@ -1581,7 +1542,7 @@ def compute_infection(nucleus_mask: np.ndarray,
                 still_free.append(reg)
         free_regions = still_free
 
-    # ── 2) Candidatos densos: solo masas enormes pasan a conteo por área ───────
+    # 2) dense candidates: only very large masses are counted by area
     dense_labels = measure.label(dense_mask, connectivity=2)
     dense_props = measure.regionprops(dense_labels, intensity_image=det_img)
     true_dense_components = 0
@@ -1591,7 +1552,7 @@ def compute_infection(nucleus_mask: np.ndarray,
     for reg in dense_props:
         owner_id = _owner_from_region(reg)
         if owner_id == 0:
-            continue  # masa densa libre en el fondo, no se asigna
+            continue  # dense mass free in the background, not assigned
         bbox = reg.bbox
         sl = (slice(bbox[0], bbox[2]), slice(bbox[1], bbox[3]))
         local_mask = dense_labels[sl] == reg.label
@@ -1603,7 +1564,7 @@ def compute_infection(nucleus_mask: np.ndarray,
 
         peaks = _local_peaks(dense_labels, reg, min_distance=3, percentile=62, max_peaks=650)
 
-        # Masa densa verdadera: tamaño claramente grande + fracción local relevante.
+        # true dense mass: clearly large and covering a relevant local fraction
         true_mass = (
             signal_area >= true_dense_min_area and
             (dense_fraction >= 0.08 or signal_area >= true_dense_min_area * 1.8) and
@@ -1612,12 +1573,12 @@ def compute_infection(nucleus_mask: np.ndarray,
 
         if true_mass:
             area_est = int(round(signal_area / dense_unit))
-            # En masas reales permitimos >50, con límite biológico operativo.
+            # real masses may exceed 50, with a practical biological limit
             n_obj = max(15, min(max(area_est, peaks), 500))
             counts_dense[owner_id] += n_obj
             true_dense_components += 1
         else:
-            # No era una masa real: tratar como cluster discreto capado.
+            # not a real mass: treat as a capped discrete cluster
             n_obj = _count_discrete_component(dense_labels, reg)
             counts_cluster[owner_id] += n_obj
             fallback_dense_as_cluster += 1
@@ -1625,9 +1586,6 @@ def compute_infection(nucleus_mask: np.ndarray,
         counts_total[owner_id] += n_obj
         assigned_dense += n_obj
 
-    print(f"[DEBUG v12] Componentes sparse detectados: {len(amas_props)}; conteo asignado: {assigned_sparse}")
-    print(f"[DEBUG v12] Candidatos densos: {len(dense_props)}; masas reales: {true_dense_components}; clusters capados: {fallback_dense_as_cluster}; conteo denso/cluster: {assigned_dense}")
-    print(f"[DEBUG v12] Total amastigotes reportado: {int(counts_total.sum())}")
 
     cytosol_mask = nucleus_mask.astype(np.int32)
     per_cell = []
@@ -1652,7 +1610,7 @@ def compute_infection(nucleus_mask: np.ndarray,
             mode = "sparse" if dense_count == 0 else "medium_dense"
             display = "15-50"
         else:
-            # >50 solo si viene de una masa densa real o de >50 componentes reales.
+            # >50 only from a real dense mass or from >50 real components
             mode = "high_dense" if dense_count > 0 else "sparse"
             display = ">50"
 
@@ -1704,7 +1662,7 @@ def compute_infection(nucleus_mask: np.ndarray,
     }
 
 
-# ─── Overlay ──────────────────────────────────────────────────────────────────
+# --- overlay ---
 def build_overlay(blue_ch: np.ndarray,
                   red_ch: np.ndarray,
                   nucleus_mask: np.ndarray,
@@ -1723,23 +1681,23 @@ def build_overlay(blue_ch: np.ndarray,
 
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
     rgb[:, :, 2] = np.clip(blue_ch.astype(np.uint16) * 2, 0, 255).astype(np.uint8)
-    # Canal de amastigotes: pintar en rojo o verde según amas_color
+    # amastigote channel painted red or green depending on amas_color
     amas_signal = np.clip(red_ch.astype(np.uint16) * red_mult, 0, 255).astype(np.uint8)
     if amas_color == "green":
-        rgb[:, :, 1] = amas_signal   # señal en canal verde
+        rgb[:, :, 1] = amas_signal   # signal in the green channel
     else:
-        rgb[:, :, 0] = amas_signal   # señal en canal rojo
+        rgb[:, :, 0] = amas_signal   # signal in the red channel
 
     infected_ids = {c["nucleus_id"] for c in results["per_cell"] if c["infected"]}
     healthy_ids  = {c["nucleus_id"] for c in results["per_cell"] if not c["infected"]}
 
-    # Contorno naranja de masas densas
+    # orange outline for dense masses
     if dense_mask.any():
         db = bdil(segmentation.find_boundaries(dense_mask, mode='outer'),
                   structure=morphology.disk(max(2, min(h,w)//800)))
         rgb[db, 0] = 255; rgb[db, 1] = 140; rgb[db, 2] = 0
 
-    # Relleno de núcleos: amarillo infectado, verde sano
+    # nucleus fill: yellow infected, green uninfected
     if infected_ids:
         m = np.isin(nucleus_mask, list(infected_ids))
         rgb[m, 0] = np.clip(rgb[m, 0].astype(int) + 180, 0, 255).astype(np.uint8)
@@ -1751,18 +1709,18 @@ def build_overlay(blue_ch: np.ndarray,
         rgb[m, 1] = np.clip(rgb[m, 1].astype(int) + 150, 0, 255).astype(np.uint8)
         rgb[m, 2] = np.clip(rgb[m, 2].astype(int) -  50, 0, 255).astype(np.uint8)
 
-    # Contorno blanco de todos los núcleos
+    # white outline for every nucleus
     thick = max(2, min(h, w) // 600)
     tb = bdil(segmentation.find_boundaries(nucleus_mask, mode='outer'),
               structure=morphology.disk(thick))
     rgb[tb] = [255, 255, 255]
 
-    # Contorno de amastigotes individuales (color según modo)
+    # outline of individual amastigotes (colour depends on mode)
     if sparse_mask.max() > 0:
         ab = bdil(segmentation.find_boundaries(sparse_mask > 0, mode='outer'),
                   structure=morphology.disk(thick))
         if amas_color == "green":
-            rgb[ab] = [0, 255, 0]      # Verde brillante
+            rgb[ab] = [0, 255, 0]      # bright green
         else:
             rgb[ab] = [255, 0, 255]    # Magenta
 
@@ -1801,7 +1759,7 @@ def build_overlay(blue_ch: np.ndarray,
                 tw, th = fsz * len(line) // 2, fsz
             lx = cx - tw // 2
             ly = cy - th // 2 + i * (th + 2)
-            # Sombra negra gruesa para máximo contraste
+            # thick black shadow for contrast
             for dx, dy in [(-1,-1),(1,-1),(-1,1),(1,1),(0,-2),(0,2),(-2,0),(2,0)]:
                 drw.text((lx+dx, ly+dy), line, fill=(0, 0, 0), font=font)
             drw.text((lx, ly), line, fill=col, font=font)
@@ -1809,7 +1767,7 @@ def build_overlay(blue_ch: np.ndarray,
     return np.array(img_pil)
 
 
-# ─── Full Pipeline ─────────────────────────────────────────────────────────────
+# --- full pipeline ---
 def run_analysis(filepath: str,
                  blue_ch_idx: int = 1,
                  red_ch_idx: int = 0,
@@ -1829,18 +1787,16 @@ def run_analysis(filepath: str,
                  amas_color: str = "red",
                  progress_callback=None) -> dict:
     
-    """
-    Pipeline completo de análisis.
+    """Run the full analysis on one image.
 
-    Nuevos parámetros:
-    - amas_channel_indices: lista de índices de canales que contienen amastigotes.
-        None → usa red_ch_idx (comportamiento legacy).
-        [0, 1] → combina canales 0 y 1 (e.g. rojo + verde) con max píxel a píxel.
-    - amas_detection_mode: "auto" | "cellpose" | "classic"
-        auto     → decide según densidad de señal (CellPose si dispersa, clásico si densa)
-        cellpose → fuerza CellPose para todos los casos; fallback a clásico si falla
-        classic  → siempre usa el método clásico (comportamiento anterior)
-    - amas_cellpose_diameter: diámetro en px para CellPose de amastigotes (None = auto)
+    amas_channel_indices: channels holding the parasite signal. None uses
+        red_ch_idx; [0, 1] combines red and green with a pixel-wise max.
+    amas_detection_mode: "auto" | "cellpose" | "classic"
+        auto     - choose from the signal density (CellPose if sparse,
+                   classic if dense)
+        cellpose - always CellPose, classic as a fallback
+        classic  - always the classic method
+    amas_cellpose_diameter: amastigote diameter for CellPose (None = auto)
     """
 
     def progress(msg, pct):
@@ -1853,53 +1809,53 @@ def run_analysis(filepath: str,
     import time as _time
     _t_total = _time.time()
 
-    progress("Cargando imagen...", 5)
+    progress("Loading image...", 5)
     img, meta = load_image(filepath)
 
-    progress("Extrayendo canales...", 15)
+    progress("Extracting channels...", 15)
     blue, red = extract_channels(img, blue_ch_idx, red_ch_idx, amas_channel_indices, meta)
 
-    progress("Segmentando núcleos (CellPose)...", 30)
+    progress("Segmenting nuclei...", 30)
     import time as _time
     _t_seg = _time.time()
 
-    # Auto-calcular radio citosol si no se especificó (=100 por defecto)
-    # Radio citosol = radio_nucleo * 2.5 (citosol ocupa ~1.5x el radio del núcleo)
-    if dilation_radius == 100:  # valor por defecto = no especificado manualmente
+    # derive the cytoplasm radius when it was left at the default (100):
+    # nucleus radius * 2.5 (cytoplasm reaches ~1.5x the nucleus radius)
+    if dilation_radius == 100:  # default value = not set by the user
         auto_diam    = _estimate_nucleus_diameter(blue)
         auto_dil_rad = int((auto_diam / 2) * 2.5)
         auto_dil_rad = max(30, min(300, auto_dil_rad))
-        print(f"[Radio citosol] Auto: diám_núcleo={auto_diam}px → radio_citosol={auto_dil_rad}px")
+        print(f"[Cytoplasm radius] auto: nucleus diameter={auto_diam}px -> radius={auto_dil_rad}px")
         dilation_radius = auto_dil_rad
 
     nuc_mask = segment_nuclei(blue,
                               diameter=nucleus_diameter,
                               flow_threshold=flow_threshold,
                               cellprob_threshold=cellprob_threshold)
-    print(f"[Tiempo] Segmentación de núcleos: {_time.time() - _t_seg:.1f}s")
+    print(f"[Time] nucleus segmentation: {_time.time() - _t_seg:.1f}s")
 
-    progress("Detectando amastigotes...", 60)
+    progress("Detecting amastigotes...", 60)
 
-    # ── Elegir método de detección ─────────────────────────────────────────────
+    # choose the detection method
     used_method = "classic"
     result_cp   = None
 
     if amas_detection_mode in ("cellpose", "auto"):
-        # En modo auto, decidir por heurística de densidad
+        # auto mode: decide from the signal density
         if amas_detection_mode == "auto":
             use_cp = _should_use_cellpose_for_amastigotes(red)
         else:
             use_cp = True
 
-        # En CPU, CellPose para amastigotes es muy lento y el método clásico
-        # funciona mejor para puntos pequeños. Forzar clásico salvo que el
-        # usuario lo pida explícitamente (modo "cellpose") teniendo GPU.
+        # On CPU, CellPose for amastigotes is very slow and the classic
+        # method works better for small spots, so use classic unless the
+        # user explicitly asks for CellPose on a GPU.
         if use_cp and not USE_GPU and amas_detection_mode == "auto":
-            print("[Pipeline] CPU detectado → amastigotes por método clásico (más rápido y preciso)")
+            print("[Pipeline] CPU: amastigotes with the classic method")
             use_cp = False
 
         if use_cp:
-            progress("Detectando amastigotes (CellPose)...", 62)
+            progress("Detecting amastigotes (CellPose)...", 62)
             result_cp = detect_amastigotes_cellpose(
                 red,
                 min_size=amas_min_size,
@@ -1909,33 +1865,33 @@ def run_analysis(filepath: str,
             if result_cp is not None:
                 sparse_mask, dense_mask, dense_analysis = result_cp
                 used_method = "cellpose"
-                print(f"[Pipeline] Detección: CellPose ✓ ({sparse_mask.max()} objetos)")
+                print(f"[Pipeline] detection: CellPose ({sparse_mask.max()} objects)")
             else:
-                print(f"[Pipeline] CellPose sin resultados → fallback a método clásico")
+                print("[Pipeline] CellPose found nothing, falling back to the classic method")
 
     if used_method == "classic":
         sparse_mask, dense_mask, dense_analysis = detect_amastigotes(
             red, amas_min_size, amas_max_size, threshold_method)
-        print(f"[Pipeline] Detección: Clásico ({sparse_mask.max()} objetos)")
+        print(f"[Pipeline] detection: classic ({sparse_mask.max()} objects)")
 
     dense_analysis['detection_method'] = used_method
 
-    progress("Calculando infección...", 80)
+    progress("Computing infection...", 80)
     results = compute_infection(
         nuc_mask, sparse_mask, dense_mask, dense_analysis,
         dilation_radius=dilation_radius,
         min_amastigotes=min_amastigotes,
         avg_amastigote_size=avg_amastigote_size)
 
-    progress("Construyendo overlay...", 90)
+    progress("Building overlay...", 90)
     overlay = build_overlay(blue, red, nuc_mask, sparse_mask, dense_mask, results, amas_color)
 
-    progress("¡Análisis completo!", 100)
+    progress("Analysis complete", 100)
 
     is_dense = any(c["mode"] in ["low_dense", "medium_dense", "high_dense"]
                    for c in results["per_cell"])
 
-    print(f"[Tiempo] TOTAL análisis imagen: {_time.time() - _t_total:.1f}s "
+    print(f"[Time] total: {_time.time() - _t_total:.1f}s "
           f"({'GPU' if USE_GPU else 'CPU'})")
 
     return {
